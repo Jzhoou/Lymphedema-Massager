@@ -1,0 +1,817 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <EEPROM.h>
+#include <WebServer.h>
+#include <HardwareSerial.h>
+
+// ===================== 硬件配置 =====================
+// ESP32-S3 串口分配：
+// - USB OTG口: 连接上位机PC (在Arduino中启用USB CDC后映射为Serial)
+// - TTL口(UART0硬件, TX0=GPIO43, RX0=GPIO44): 连接HT32主控
+// - 软串口(任意GPIO): 输出调试信息，建议使用GPIO17(TX)和GPIO18(RX)
+// 注意：需要在Arduino IDE中设置 "USB CDC on Boot: Enabled"
+// 这样Serial就是USB CDC，UART0硬件引脚可单独配置
+
+#define MAIN_SERIAL_HW Serial0  // UART0硬件，TX0=GPIO43, RX0=GPIO44，连接HT32主控
+#define PC_SERIAL_USB Serial    // USB CDC串口 (OTG口)，连接上位机
+#define DEBUG_SERIAL Serial1        // UART1: 调试信息输出，可自定义引脚
+
+
+// 软串口调试引脚配置（可根据实际连接修改）
+#define DEBUG_TX_PIN 17             // 调试串口TX引脚
+#define DEBUG_RX_PIN 18             // 调试串口RX引脚（如果不需输入，可不接）
+#define DEBUG_BAUD 115200 // 调试串口波特率
+
+// 调试等级定义
+#define DEBUG_LEVEL_ERROR  0
+#define DEBUG_LEVEL_WARN   1
+#define DEBUG_LEVEL_INFO   2
+#define DEBUG_LEVEL_DEBUG  3
+#define DEBUG_LEVEL_VERBOSE 4
+
+// 当前调试等级（可修改为需要的等级）
+#define DEBUG_LEVEL DEBUG_LEVEL_VERBOSE
+
+// 调试宏定义
+// 修改调试宏，使用 DEBUG_SERIAL
+#define DEBUG_PRINT(level, ...) \
+    do { \
+        if (level <= DEBUG_LEVEL) { \
+            DEBUG_SERIAL.print("["); \
+            DEBUG_SERIAL.print(millis()); \
+            DEBUG_SERIAL.print("] "); \
+            switch(level) { \
+                case DEBUG_LEVEL_ERROR: DEBUG_SERIAL.print("[ERR] "); break; \
+                case DEBUG_LEVEL_WARN:  DEBUG_SERIAL.print("[WARN] "); break; \
+                case DEBUG_LEVEL_INFO:  DEBUG_SERIAL.print("[INFO] "); break; \
+                case DEBUG_LEVEL_DEBUG: DEBUG_SERIAL.print("[DEBUG] "); break; \
+                case DEBUG_LEVEL_VERBOSE: DEBUG_SERIAL.print("[VERB] "); break; \
+            } \
+            DEBUG_SERIAL.print(__FUNCTION__); \
+            DEBUG_SERIAL.print(":"); \
+            DEBUG_SERIAL.print(__LINE__); \
+            DEBUG_SERIAL.print(" - "); \
+            DEBUG_SERIAL.print(__VA_ARGS__); \
+            DEBUG_SERIAL.println(); \
+        } \
+    } while(0)
+
+#define DEBUG_SIMPLE(level, msg) \
+    do { \
+        if (level <= DEBUG_LEVEL) { \
+            DEBUG_SERIAL.print("["); \
+            DEBUG_SERIAL.print(millis()); \
+            DEBUG_SERIAL.print("] "); \
+            DEBUG_SERIAL.println(msg); \
+        } \
+    } while(0)
+
+// EEPROM和网络配置
+#define EEPROM_SIZE 512
+#define SSID_ADDR   0
+#define PASS_ADDR   32
+#define TCP_PORT    8080
+#define UDP_PORT    9527
+#define UDP_DATA_PORT 9528
+#define AP_SSID     "RehabDevice_Config"
+#define AP_PASS     ""
+
+// ===================== 协议常量 =====================
+#define FRAME_H1      0xAA
+#define FRAME_H2      0x55
+#define FRAME_TAIL    0x0D
+#define DIR_DEV2UP    0x01
+#define CMD_DISCOVERY_REQ 0x04
+#define CMD_DISCOVERY_RES 0x05
+
+// ===================== 函数声明 =====================
+void handleTCP();
+void handleUDP();
+bool shouldUseUdp(uint8_t cmd);
+void sendDiscoveryResponse();
+void startAPConfig();
+void handleSerialConfig();
+void saveWiFi();
+void loadWiFi();
+uint16_t crc16(byte* data, int len);
+void cleanupConnection();
+void printWiFiStatus();  // 添加WiFi状态打印函数
+void printMemoryInfo();   // 添加内存信息打印函数
+
+// ===================== 全局变量 =====================
+WiFiClient tcpClient;
+WiFiServer tcpServer(TCP_PORT);
+WiFiUDP udp;
+WiFiUDP udpData;
+WebServer server(80);
+IPAddress remoteIP;
+uint16_t remotePort = 0;
+
+IPAddress upstreamUdpIP;
+uint16_t upstreamUdpPort = 0;
+
+char wifiSSID[32] = {0};
+char wifiPASS[64] = {0};
+bool wifiConfigured = false;
+
+// ===================== TCP Keep-Alive =====================
+#define TCP_KEEPALIVE_IDLE     5     // 5秒空闲后开始探测
+#define TCP_KEEPALIVE_INTERVAL 3     // 探测间隔3秒
+#define TCP_KEEPALIVE_COUNT    3     // 最多3次探测失败
+
+// 连接健康检查
+#define HEALTH_CHECK_INTERVAL  10000  // 10秒检查一次
+#define CONNECTION_TIMEOUT     10000  // 10秒无数据认为连接死亡
+
+unsigned long lastRecvTime = 0;      // 最后一次收到TCP数据的时间
+unsigned long lastHealthCheck = 0;   // 最后一次健康检查的时间
+
+// ===================== 帧缓冲区 =====================
+// 主控->WiFi模块 帧缓冲区
+static uint8_t mainFrameBuf[256];
+static int mainFrameIdx = 0;
+static uint16_t mainExpectedLen = 0;
+
+// 上位机USB串口->WiFi模块 帧缓冲区
+static uint8_t pcFrameBuf[256];
+static int pcFrameIdx = 0;
+static uint16_t pcExpectedLen = 0;
+
+// ===================== ARP缓存保持 =====================
+unsigned long lastArpKeepalive = 0;
+
+// 统计计数器（用于调试）
+static uint32_t totalMainFrames = 0;
+static uint32_t totalPCFrames = 0;
+static uint32_t totalTCPBytesReceived = 0;
+static uint32_t totalTCPBytesSent = 0;
+static uint32_t totalUDPBytesSent = 0;
+
+// ===================== 判断是否使用UDP发送 =====================
+bool shouldUseUdp(uint8_t cmd) {
+    // 所有数据都通过UDP发送
+    return true;
+    switch (cmd) {
+        case 0x50:  // PRESSURE
+        case 0x51:  // EDEMA
+        case 0x52:  // MOTOR_STATUS
+        case 0x53:  // PROGRESS
+            return true;
+        default:
+            return false;
+    }
+}
+
+// ===================== CRC16计算 =====================
+uint16_t crc16(byte* data, int len) {
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for(int j = 0; j < 8; j++) {
+            if(crc & 1) crc = (crc >> 1) ^ 0xA001;
+            else crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+// ===================== 打印WiFi状态 =====================
+void printWiFiStatus() {
+    if (WiFi.status() == WL_CONNECTED) {
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "WiFi Connected - SSID: " + String(WiFi.SSID()) + 
+                    ", RSSI: " + String(WiFi.RSSI()) + "dBm" +
+                    ", IP: " + WiFi.localIP().toString());
+    } else {
+        DEBUG_PRINT(DEBUG_LEVEL_WARN, "WiFi Not Connected - Status: " + String(WiFi.status()));
+    }
+}
+
+// ===================== 打印内存信息 =====================
+void printMemoryInfo() {
+    DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "Free Heap: " + String(ESP.getFreeHeap()) + 
+                " bytes, Free PSRAM: " + String(ESP.getFreePsram()) + " bytes");
+}
+
+// ===================== 处理主控->WiFi的帧（转发到网络或上位机USB串口） =====================
+void processMainFrame() {
+    if (mainFrameIdx == 0) return;
+    
+    totalMainFrames++;
+    uint8_t cmd = mainFrameBuf[4];
+    uint16_t dataLen = mainFrameBuf[2] | (mainFrameBuf[3] << 8);
+    bool useUdp = shouldUseUdp(cmd);
+    
+    DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "Main frame received - CMD: 0x" + String(cmd, HEX) + 
+                ", Len: " + String(mainFrameIdx) + ", DataLen: " + String(dataLen) +
+                ", UseUDP: " + String(useUdp));
+    
+    // 始终通过USB串口发送给上位机（不管网络是否连接）
+    size_t usbWritten = PC_SERIAL_USB.write(mainFrameBuf, mainFrameIdx);
+    if (usbWritten != mainFrameIdx) {
+        DEBUG_PRINT(DEBUG_LEVEL_WARN, "USB write incomplete: " + String(usbWritten) + "/" + String(mainFrameIdx));
+    }
+
+    // 通过网络发送（如果已连接）
+    bool sentViaNetwork = false;
+    if (useUdp && upstreamUdpIP != IPAddress(0,0,0,0)) {
+        // 通过UDP发送数据帧（高频数据）
+        udpData.beginPacket(upstreamUdpIP, upstreamUdpPort);
+        size_t udpWritten = udpData.write(mainFrameBuf, mainFrameIdx);
+        if (udpData.endPacket()) {
+            sentViaNetwork = true;
+            totalUDPBytesSent += mainFrameIdx;
+            DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "UDP sent to " + upstreamUdpIP.toString() + ":" + String(upstreamUdpPort) +
+                        ", bytes: " + String(mainFrameIdx));
+        } else {
+            DEBUG_PRINT(DEBUG_LEVEL_WARN, "UDP send failed");
+        }
+    } else if (tcpClient && tcpClient.connected()) {
+        // 通过TCP发送控制帧
+        size_t tcpWritten = tcpClient.write(mainFrameBuf, mainFrameIdx);
+        if (tcpWritten == mainFrameIdx) {
+            sentViaNetwork = true;
+            totalTCPBytesSent += mainFrameIdx;
+            DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "TCP sent, bytes: " + String(mainFrameIdx));
+        } else {
+            DEBUG_PRINT(DEBUG_LEVEL_WARN, "TCP write incomplete: " + String(tcpWritten) + "/" + String(mainFrameIdx));
+        }
+    }
+    
+    if (sentViaNetwork) {
+        DEBUG_SIMPLE(DEBUG_LEVEL_DEBUG, "[Forward] Sent via network + USB");
+    } else {
+        if (upstreamUdpIP == IPAddress(0,0,0,0) && (!tcpClient || !tcpClient.connected())) {
+            DEBUG_SIMPLE(DEBUG_LEVEL_DEBUG, "[Forward] Sent via USB only (no network connection)");
+        } else if (useUdp && upstreamUdpIP == IPAddress(0,0,0,0)) {
+            DEBUG_SIMPLE(DEBUG_LEVEL_WARN, "[Forward] UDP target not set");
+        } else if (!useUdp && (!tcpClient || !tcpClient.connected())) {
+            DEBUG_SIMPLE(DEBUG_LEVEL_WARN, "[Forward] TCP not connected");
+        }
+    }
+    
+    mainFrameIdx = 0;
+    mainExpectedLen = 0;
+}
+
+// ===================== 处理上位机USB串口->WiFi的帧（直接转发给主控） =====================
+void processPCFrame() {
+    if (pcFrameIdx == 0) return;
+    
+    totalPCFrames++;
+    uint8_t cmd = pcFrameBuf[4];
+    uint16_t dataLen = pcFrameBuf[2] | (pcFrameBuf[3] << 8);
+    
+    DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "PC frame received - CMD: 0x" + String(cmd, HEX) + 
+                ", Len: " + String(pcFrameIdx) + ", DataLen: " + String(dataLen));
+    
+    // 上位机数据直接转发给主控
+    size_t written = MAIN_SERIAL_HW.write(pcFrameBuf, pcFrameIdx);
+    if (written != pcFrameIdx) {
+        DEBUG_PRINT(DEBUG_LEVEL_WARN, "Main serial write incomplete: " + String(written) + "/" + String(pcFrameIdx));
+    }
+    
+    pcFrameIdx = 0;
+    pcExpectedLen = 0;
+}
+
+// ===================== 解析主控串口数据 =====================
+void parseMainSerial(uint8_t b) {
+    if (mainFrameIdx == 0) {
+        if (b == FRAME_H1) {
+            mainFrameBuf[mainFrameIdx++] = b;
+        }
+        return;
+    }
+    
+    if (mainFrameIdx == 1) {
+        if (b == FRAME_H2) {
+            mainFrameBuf[mainFrameIdx++] = b;
+        } else {
+            mainFrameIdx = 0;
+            DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "Main frame sync lost, expected 0x55, got 0x" + String(b, HEX));
+        }
+        return;
+    }
+    
+    if (mainFrameIdx < 256) {
+        mainFrameBuf[mainFrameIdx++] = b;
+    } else {
+        mainFrameIdx = 0;
+        DEBUG_PRINT(DEBUG_LEVEL_WARN, "Main frame buffer overflow");
+        return;
+    }
+    
+    if (mainFrameIdx == 4) {
+        mainExpectedLen = mainFrameBuf[2] | (mainFrameBuf[3] << 8);
+        mainExpectedLen = 2 + 2 + mainExpectedLen + 2 + 1;  // 帧头2 + 长度2 + 数据 + CRC2 + 帧尾1
+        if (mainExpectedLen > 256) {
+            DEBUG_PRINT(DEBUG_LEVEL_WARN, "Invalid main frame length: " + String(mainExpectedLen));
+            mainFrameIdx = 0;
+            mainExpectedLen = 0;
+        }
+    }
+    
+    if (mainExpectedLen > 0 && mainFrameIdx == mainExpectedLen) {
+        if (mainFrameBuf[mainFrameIdx - 1] == FRAME_TAIL) {
+            processMainFrame();
+        } else {
+            DEBUG_PRINT(DEBUG_LEVEL_WARN, "Main frame tail mismatch, expected 0x0D, got 0x" + 
+                       String(mainFrameBuf[mainFrameIdx - 1], HEX));
+            mainFrameIdx = 0;
+            mainExpectedLen = 0;
+        }
+    }
+}
+
+// ===================== 解析上位机USB串口数据 =====================
+void parsePCSerial(uint8_t b) {
+    if (pcFrameIdx == 0) {
+        if (b == FRAME_H1) {
+            pcFrameBuf[pcFrameIdx++] = b;
+        }
+        return;
+    }
+    
+    // 忽略非帧数据（不是以AA 55开头的）
+    if (pcFrameIdx == 1) {
+        if (b == FRAME_H2) {
+            pcFrameBuf[pcFrameIdx++] = b;
+        } else {
+            pcFrameIdx = 0;
+            DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "PC frame sync lost, expected 0x55, got 0x" + String(b, HEX));
+        }
+        return;
+    }
+    
+    if (pcFrameIdx < 256) {
+        pcFrameBuf[pcFrameIdx++] = b;
+    } else {
+        pcFrameIdx = 0;
+        DEBUG_PRINT(DEBUG_LEVEL_WARN, "PC frame buffer overflow");
+        return;
+    }
+    
+    if (pcFrameIdx == 4) {
+        pcExpectedLen = pcFrameBuf[2] | (pcFrameBuf[3] << 8);
+        pcExpectedLen = 2 + 2 + pcExpectedLen + 2 + 1;
+        if (pcExpectedLen > 256) {
+            DEBUG_PRINT(DEBUG_LEVEL_WARN, "Invalid PC frame length: " + String(pcExpectedLen));
+            pcFrameIdx = 0;
+            pcExpectedLen = 0;
+        }
+    }
+    
+    if (pcExpectedLen > 0 && pcFrameIdx == pcExpectedLen) {
+        if (pcFrameBuf[pcFrameIdx - 1] == FRAME_TAIL) {
+            processPCFrame();
+        } else {
+            DEBUG_PRINT(DEBUG_LEVEL_WARN, "PC frame tail mismatch, expected 0x0D, got 0x" + 
+                       String(pcFrameBuf[pcFrameIdx - 1], HEX));
+            pcFrameIdx = 0;
+            pcExpectedLen = 0;
+        }
+    }
+}
+
+// ===================== TCP处理（带Keep-Alive和健康检查） =====================
+void handleTCP() {
+    // 处理新客户端连接
+    if (tcpServer.hasClient()) {
+        WiFiClient newClient = tcpServer.available();
+        
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "New TCP client connecting...");
+        
+        // 如果已有旧连接，不管是否存活都先关闭
+        if (tcpClient) {
+            if (tcpClient.connected()) {
+                DEBUG_PRINT(DEBUG_LEVEL_INFO, "Closing existing TCP connection");
+                tcpClient.stop();
+            }
+            // 清理缓冲区
+            mainFrameIdx = 0;
+            mainExpectedLen = 0;
+            pcFrameIdx = 0;
+            pcExpectedLen = 0;
+        }
+        
+        // 接受新连接
+        tcpClient = newClient;
+        tcpClient.setNoDelay(true);
+        tcpClient.setTimeout(5000);  // 设置超时5秒，帮助检测断线
+        
+        upstreamUdpIP = tcpClient.remoteIP();
+        upstreamUdpPort = UDP_DATA_PORT;
+        lastRecvTime = millis();  // 记录连接建立时间
+        
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "TCP client connected from " + upstreamUdpIP.toString() + 
+                   ":" + String(tcpClient.remotePort()));
+        
+        // 发送初始化包建立UDP路由
+        if (upstreamUdpIP != IPAddress(0,0,0,0)) {
+            udpData.beginPacket(upstreamUdpIP, upstreamUdpPort);
+            udpData.write((uint8_t)0);
+            if (udpData.endPacket()) {
+                DEBUG_PRINT(DEBUG_LEVEL_DEBUG, "UDP init packet sent to " + upstreamUdpIP.toString() + ":" + String(upstreamUdpPort));
+            }
+        }
+    }
+
+    // 处理已连接客户端的数据
+    if (tcpClient && tcpClient.connected()) {
+        // TCP -> 主控串口（网络数据直接转发给主控）
+        int tcpAvailable = tcpClient.available();
+        if (tcpAvailable > 0) {
+            // 更新最后接收时间
+            lastRecvTime = millis();
+            
+            int toRead = tcpAvailable > 128 ? 128 : tcpAvailable;
+            uint8_t buf[128];
+            int len = tcpClient.read(buf, toRead);
+            if (len > 0) {
+                totalTCPBytesReceived += len;
+                DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "TCP received " + String(len) + " bytes from client");
+                MAIN_SERIAL_HW.write(buf, len);
+            }
+        }
+    }
+    
+    // ==================== 定期健康检查 ====================
+    unsigned long now = millis();
+    if (now - lastHealthCheck > HEALTH_CHECK_INTERVAL) {
+        lastHealthCheck = now;
+        
+        if (tcpClient) {
+            bool isConnected = tcpClient.connected();
+            
+            if (!isConnected) {
+                // 连接已断开
+                DEBUG_PRINT(DEBUG_LEVEL_WARN, "TCP client disconnected (not connected)");
+                tcpClient.stop();
+                cleanupConnection();
+            } else {
+                // 检查是否超时未收到数据
+                unsigned long idleTime = now - lastRecvTime;
+                if (idleTime > CONNECTION_TIMEOUT) {
+                    DEBUG_PRINT(DEBUG_LEVEL_WARN, "TCP connection timeout: idle " + String(idleTime) + "ms");
+                    tcpClient.stop();
+                    cleanupConnection();
+                } else if (idleTime > 5000) {
+                    DEBUG_PRINT(DEBUG_LEVEL_DEBUG, "TCP connection idle: " + String(idleTime) + "ms");
+                }
+            }
+        }
+    }
+    
+    // Wi-Fi 重连检查
+    static unsigned long lastReconnectCheck = 0;
+    static int lastWiFiStatus = WL_CONNECTED;
+    if (now - lastReconnectCheck > 5000) {
+        lastReconnectCheck = now;
+        int currentStatus = WiFi.status();
+        if (currentStatus != WL_CONNECTED) {
+            DEBUG_PRINT(DEBUG_LEVEL_WARN, "WiFi lost, status=" + String(currentStatus) + ", reconnecting...");
+            WiFi.reconnect();
+        } else if (lastWiFiStatus != WL_CONNECTED) {
+            DEBUG_PRINT(DEBUG_LEVEL_INFO, "WiFi reconnected successfully");
+            printWiFiStatus();
+        }
+        lastWiFiStatus = currentStatus;
+    }
+}
+
+// ===================== 清理连接资源 =====================
+void cleanupConnection() {
+    // 清空接收缓冲区
+    mainFrameIdx = 0;
+    mainExpectedLen = 0;
+    pcFrameIdx = 0;
+    pcExpectedLen = 0;
+    
+    // 清除UDP目标
+    upstreamUdpIP = IPAddress(0,0,0,0);
+    upstreamUdpPort = 0;
+    lastRecvTime = 0;
+    
+    DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "TCP connection resources cleaned up");
+}
+
+// ===================== UDP发现处理 =====================
+void handleUDP() {
+    int len = udp.parsePacket();
+    if (len <= 0) return;
+    
+    byte buf[64];
+    udp.read(buf, len);
+    remoteIP = udp.remoteIP();
+    remotePort = udp.remotePort();
+
+    DEBUG_PRINT(DEBUG_LEVEL_DEBUG, "UDP packet received from " + remoteIP.toString() + ":" + String(remotePort) + 
+                ", len=" + String(len));
+
+    if (len >= 5 && buf[0] == FRAME_H1 && buf[1] == FRAME_H2 && buf[4] == CMD_DISCOVERY_REQ) {
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "Discovery request received, sending response");
+        sendDiscoveryResponse();
+    }
+    
+    // 通过发现请求建立UDP数据通道
+    upstreamUdpIP = remoteIP;
+    upstreamUdpPort = UDP_DATA_PORT;
+    
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "UDP data channel set to " + upstreamUdpIP.toString() + ":" + String(upstreamUdpPort));
+    
+    // 发送初始化包建立路由
+    udpData.beginPacket(upstreamUdpIP, upstreamUdpPort);
+    udpData.write((uint8_t)0);
+    udpData.endPacket();
+
+    // 其他UDP数据包也转发给主控
+    if (buf[0] == FRAME_H1 && buf[1] == FRAME_H2 && buf[4] != CMD_DISCOVERY_REQ) {
+        DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "Forwarding UDP data to main MCU, cmd=0x" + String(buf[4], HEX));
+        MAIN_SERIAL_HW.write(buf, len);
+    }
+}
+
+// ===================== 发送发现响应 =====================
+void sendDiscoveryResponse() {
+    byte resp[64] = {0};
+    int idx = 0;
+    
+    resp[idx++] = FRAME_H1;
+    resp[idx++] = FRAME_H2;
+    
+    uint16_t dataLen = 38;
+    resp[idx++] = lowByte(dataLen);
+    resp[idx++] = highByte(dataLen);
+    
+    resp[idx++] = CMD_DISCOVERY_RES;
+    resp[idx++] = DIR_DEV2UP;
+
+    IPAddress ip = WiFi.localIP();
+    resp[idx++] = ip[0];
+    resp[idx++] = ip[1];
+    resp[idx++] = ip[2];
+    resp[idx++] = ip[3];
+
+    resp[idx++] = lowByte(TCP_PORT);
+    resp[idx++] = highByte(TCP_PORT);
+
+    memset(&resp[idx], 0, 15);
+    strncpy((char*)&resp[idx], "RehabDevice_S3", 15);
+    idx += 15;
+
+    memset(&resp[idx], 0, 15);
+    strncpy((char*)&resp[idx], "v1.0.0", 15);
+    idx += 15;
+
+    uint16_t crc = crc16(resp + 4, dataLen);
+    resp[idx++] = lowByte(crc);
+    resp[idx++] = highByte(crc);
+    resp[idx++] = FRAME_TAIL;
+
+    udp.beginPacket(remoteIP, UDP_PORT);
+    udp.write(resp, idx);
+    udp.endPacket();
+    
+    DEBUG_PRINT(DEBUG_LEVEL_DEBUG, "Discovery response sent to " + remoteIP.toString() + ":" + String(UDP_PORT) +
+                ", len=" + String(idx));
+}
+
+// ===================== AP配置模式 =====================
+void startAPConfig() {
+    DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "Starting AP config mode with SSID: " + String(AP_SSID));
+    
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASS);
+    
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "AP started, IP: " + WiFi.softAPIP().toString());
+    
+    server.on("/", []() {
+        String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+        html += "<title>WiFi配置</title><style>body{font-family:Arial;margin:20px;background:#f5f5f5;}";
+        html += ".box{background:white;padding:20px;border-radius:8px;max-width:400px;margin:0 auto;}";
+        html += "select,input,button{width:100%;padding:10px;margin:8px 0;box-sizing:border-box;}</style></head><body>";
+        html += "<div class='box'><h3>ESP32-S3 设备 WiFi 配置</h3>";
+        
+        int n = WiFi.scanNetworks();
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "WiFi scan completed, found " + String(n) + " networks");
+        
+        if (n > 0) {
+            html += "<form action='/set' method='POST'>";
+            html += "<select name='ssid' required>";
+            for (int i = 0; i < n && i < 20; i++) {
+                html += "<option value='" + WiFi.SSID(i) + "'>" + WiFi.SSID(i) + " (" + WiFi.RSSI(i) + "dBm)</option>";
+            }
+            html += "</select>";
+            html += "<input type='password' name='pass' placeholder='WiFi密码' required>";
+            html += "<button type='submit'>保存并重启</button></form>";
+        } else {
+            html += "<p>未发现 WiFi 网络</p>";
+        }
+        html += "</div></body></html>";
+        server.send(200, "text/html", html);
+        WiFi.scanDelete();
+    });
+
+    server.on("/set", []() {
+        String ssid = server.arg("ssid");
+        String pass = server.arg("pass");
+        ssid.toCharArray(wifiSSID, 32);
+        pass.toCharArray(wifiPASS, 64);
+        saveWiFi();
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "WiFi config saved - SSID: " + ssid);
+        server.send(200, "text/html", "配置已保存，设备重启中...");
+        delay(500);
+        ESP.restart();
+    });
+    
+    server.begin();
+    DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "Web server started");
+}
+
+// ===================== 串口配置处理 =====================
+void handleSerialConfig() {
+    if (!MAIN_SERIAL_HW.available()) return;
+    String s = MAIN_SERIAL_HW.readStringUntil('\n');
+    s.trim();
+    
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "Config command received: " + s);
+    
+    if (s.startsWith("SSID=")) { 
+        s.substring(5).toCharArray(wifiSSID, 32); 
+        saveWiFi(); 
+        MAIN_SERIAL_HW.println("OK:SSID");
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "SSID saved: " + String(wifiSSID));
+    }
+    else if (s.startsWith("PASS=")) { 
+        s.substring(5).toCharArray(wifiPASS, 64); 
+        saveWiFi(); 
+        MAIN_SERIAL_HW.println("OK:PASS");
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "Password saved");
+    }
+    else if (s == "RESET") { 
+        memset(wifiSSID, 0, 32); 
+        memset(wifiPASS, 0, 64); 
+        saveWiFi(); 
+        MAIN_SERIAL_HW.println("OK:RESET");
+        DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "WiFi credentials reset");
+    }
+    else if (s == "REBOOT") { 
+        DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "Rebooting...");
+        ESP.restart(); 
+    }
+    else if (s == "STATUS") {
+        MAIN_SERIAL_HW.println("WiFi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected"));
+        if (WiFi.status() == WL_CONNECTED) {
+            MAIN_SERIAL_HW.println("IP: " + WiFi.localIP().toString());
+            MAIN_SERIAL_HW.println("SSID: " + String(wifiSSID));
+        }
+        MAIN_SERIAL_HW.println("TCP Client: " + String(tcpClient && tcpClient.connected() ? "Connected" : "Disconnected"));
+        DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "Status command processed");
+    }
+    else if (s == "STATS") {
+        MAIN_SERIAL_HW.println("=== Statistics ===");
+        MAIN_SERIAL_HW.println("Main Frames: " + String(totalMainFrames));
+        MAIN_SERIAL_HW.println("PC Frames: " + String(totalPCFrames));
+        MAIN_SERIAL_HW.println("TCP RX: " + String(totalTCPBytesReceived) + " bytes");
+        MAIN_SERIAL_HW.println("TCP TX: " + String(totalTCPBytesSent) + " bytes");
+        MAIN_SERIAL_HW.println("UDP TX: " + String(totalUDPBytesSent) + " bytes");
+        MAIN_SERIAL_HW.println("Free Heap: " + String(ESP.getFreeHeap()) + " bytes");
+        DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "Statistics command processed");
+    }
+}
+
+// ===================== WiFi凭据保存/加载 =====================
+void saveWiFi() { 
+    for(int i = 0; i < 32; i++) EEPROM.write(SSID_ADDR + i, wifiSSID[i]); 
+    for(int i = 0; i < 64; i++) EEPROM.write(PASS_ADDR + i, wifiPASS[i]); 
+    EEPROM.commit(); 
+    DEBUG_SIMPLE(DEBUG_LEVEL_DEBUG, "WiFi credentials saved to EEPROM");
+}
+
+void loadWiFi() { 
+    for(int i = 0; i < 32; i++) wifiSSID[i] = EEPROM.read(SSID_ADDR + i); 
+    for(int i = 0; i < 64; i++) wifiPASS[i] = EEPROM.read(PASS_ADDR + i); 
+    if (strlen(wifiSSID) > 0) {
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "WiFi credentials loaded - SSID: " + String(wifiSSID));
+    } else {
+        DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "No WiFi credentials found in EEPROM");
+    }
+}
+
+// ===================== 主程序 =====================
+void setup() {
+    // 初始化调试串口（UART1）
+    DEBUG_SERIAL.begin(DEBUG_BAUD, SERIAL_8N1, DEBUG_RX_PIN, DEBUG_TX_PIN);
+    DEBUG_SERIAL.println();
+    DEBUG_SERIAL.println("========================================");
+    DEBUG_SERIAL.println("ESP32-S3 Rehabilitation Device Gateway");
+    DEBUG_SERIAL.println("Debug Serial Initialized (UART1)");
+    DEBUG_SERIAL.println("========================================");
+    
+    // 打印芯片信息
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "Chip: ESP32-S3");
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "CPU Freq: " + String(ESP.getCpuFreqMHz()) + " MHz");
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "Free Heap: " + String(ESP.getFreeHeap()) + " bytes");
+    #ifdef BOARD_HAS_PSRAM
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "PSRAM: " + String(ESP.getPsramSize()) + " bytes");
+    #endif
+    
+    // 初始化主控串口 (UART0硬件: TX0=GPIO43, RX0=GPIO44)
+    MAIN_SERIAL_HW.begin(460800, SERIAL_8N1, 44, 43);  // RX=GPIO44, TX=GPIO43
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "Main serial (UART0) initialized: 460800 baud, RX=44, TX=43");
+    
+    // 初始化上位机USB CDC串口 (OTG口)
+    PC_SERIAL_USB.begin(460800);
+    DEBUG_PRINT(DEBUG_LEVEL_INFO, "USB CDC serial initialized: 460800 baud");
+
+    EEPROM.begin(EEPROM_SIZE);
+    loadWiFi();
+
+    WiFi.setAutoReconnect(true);
+    WiFi.setSleep(false);  // 禁用休眠，保持连接稳定
+
+    if (strlen(wifiSSID) > 0) {
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "Connecting to WiFi: " + String(wifiSSID));
+        WiFi.begin(wifiSSID, wifiPASS);
+        unsigned long start = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+            delay(100);
+            DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, ".");
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            printWiFiStatus();
+        } else {
+            DEBUG_PRINT(DEBUG_LEVEL_WARN, "WiFi connection timeout");
+        }
+    } else {
+        DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "No WiFi credentials found");
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "Starting AP configuration mode");
+        startAPConfig();
+    } else {
+        wifiConfigured = true;
+        udp.begin(UDP_PORT);
+        udpData.begin(UDP_DATA_PORT);
+        tcpServer.begin();
+        tcpServer.setNoDelay(true);
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "TCP server started on port " + String(TCP_PORT));
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "UDP discovery on port " + String(UDP_PORT));
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "UDP data on port " + String(UDP_DATA_PORT));
+    }
+    
+    DEBUG_SIMPLE(DEBUG_LEVEL_INFO, "Setup completed, entering main loop");
+}
+
+void loop() {
+    static unsigned long lastStatsPrint = 0;
+    unsigned long now = millis();
+    
+    // 定期打印统计信息（每60秒）
+    if (now - lastStatsPrint > 60000) {
+        lastStatsPrint = now;
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "=== Periodic Stats ===");
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "Main frames: " + String(totalMainFrames) + ", PC frames: " + String(totalPCFrames));
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "TCP TX/RX: " + String(totalTCPBytesSent) + "/" + String(totalTCPBytesReceived) + " bytes");
+        DEBUG_PRINT(DEBUG_LEVEL_INFO, "UDP TX: " + String(totalUDPBytesSent) + " bytes");
+        printMemoryInfo();
+        if (wifiConfigured && WiFi.status() == WL_CONNECTED) {
+            DEBUG_PRINT(DEBUG_LEVEL_DEBUG, "WiFi RSSI: " + String(WiFi.RSSI()) + " dBm");
+        }
+    }
+    
+    if (wifiConfigured) {
+        // 每 30 秒发一个空包保持 ARP 缓存活跃
+        if (now - lastArpKeepalive > 30000) {
+            if (upstreamUdpIP != IPAddress(0,0,0,0) && tcpClient && tcpClient.connected()) {
+                udpData.beginPacket(upstreamUdpIP, upstreamUdpPort);
+                udpData.write((uint8_t)0xFF);
+                if (udpData.endPacket()) {
+                    DEBUG_PRINT(DEBUG_LEVEL_VERBOSE, "ARP keepalive sent to " + upstreamUdpIP.toString());
+                }
+            }
+            lastArpKeepalive = now;
+        }
+        
+        handleTCP();
+        handleUDP();
+        //handleSerialConfig();
+    } else {
+        server.handleClient();
+    }
+    
+    // 处理主控->WiFi模块数据（从UART0硬件读取）
+    while (MAIN_SERIAL_HW.available() > 0) {
+        uint8_t b = MAIN_SERIAL_HW.read();
+        parseMainSerial(b);
+    }
+    
+    // 处理上位机USB串口->WiFi模块数据
+    while (PC_SERIAL_USB.available() > 0) {
+        uint8_t b = PC_SERIAL_USB.read();
+        parsePCSerial(b);
+    }
+    
+    delay(1);
+}

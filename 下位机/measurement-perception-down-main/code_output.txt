@@ -1,0 +1,5599 @@
+﻿===== AD5933.cpp =====
+#include "AD5933.h"
+#include <math.h>
+
+// ============================================================
+// 底层I2C通信函数
+// ============================================================
+
+/**
+ * @brief 从AD5933读取单个字节
+ * @details 先设置地址指针，再请求数据
+ */
+int AD5933::getByte(byte address, byte* value) {
+    // 开始I2C传输，设置寄存器指针（使用宏定义的I2C总线）
+    AD5933_I2C_BUS.beginTransmission(AD5933_ADDR);
+    AD5933_I2C_BUS.write(ADDR_PTR);           // 发送地址指针命令
+    AD5933_I2C_BUS.write(address);            // 发送目标寄存器地址
+    if (AD5933_I2C_BUS.endTransmission() != 0) return 4;  // 传输失败
+    
+    // 请求读取1字节数据
+    AD5933_I2C_BUS.requestFrom((uint8_t)AD5933_ADDR, (uint8_t)1);
+    if (AD5933_I2C_BUS.available()) {
+        *value = AD5933_I2C_BUS.read();       // 读取数据
+        return 0;                             // 成功
+    }
+    return 4;                                 // 无数据可读
+}
+
+/**
+ * @brief 向AD5933写入单个字节
+ * @details 直接向指定寄存器写入数据
+ */
+bool AD5933::sendByte(byte address, byte value) {
+    AD5933_I2C_BUS.beginTransmission(AD5933_ADDR);
+    AD5933_I2C_BUS.write(address);            // 发送寄存器地址
+    AD5933_I2C_BUS.write(value);              // 发送数据
+    return AD5933_I2C_BUS.endTransmission() == 0;  // 返回是否成功
+}
+
+// ============================================================
+// 基础配置函数
+// ============================================================
+
+/**
+ * @brief 复位AD5933
+ * @details 通过设置控制寄存器2的复位位来复位芯片
+ */
+bool AD5933::reset() {
+    byte val;
+    if (getByte(CTRL_REG2, &val) != 0) return false;  // 读取当前值
+    val |= CTRL_RESET;                                 // 设置复位位
+    return sendByte(CTRL_REG2, val);                   // 写回寄存器
+}
+
+/**
+ * @brief 设置控制模式
+ * @details 修改控制寄存器1的高4位，保留低4位设置
+ */
+bool AD5933::setControlMode(byte mode) {
+    byte val;
+    if (getByte(CTRL_REG1, &val) != 0) return false;
+    val = (val & 0x0F) | mode;      // 保留低4位，更新高4位
+    return sendByte(CTRL_REG1, val);
+}
+
+/**
+ * @brief 设置时钟源
+ * @details 修改控制寄存器2的时钟选择位（bit3）
+ */
+bool AD5933::setInternalClock(bool internal) {
+    byte val;
+    if (getByte(CTRL_REG2, &val) != 0) return false;
+    if (internal)
+        val &= ~0x08;               // 清除bit3 = 内部时钟
+    else
+        val |= 0x08;                // 设置bit3 = 外部时钟
+    return sendByte(CTRL_REG2, val);
+}
+
+/**
+ * @brief 设置起始频率
+ * @details 频率码计算公式：freqCode = freq / (MCLK/4) * 2^27
+ *          MCLK = 16.776MHz（内部时钟）
+ *          写入3个寄存器（24位）
+ */
+bool AD5933::setStartFrequency(unsigned long freq) {
+    // 计算24位频率码
+    long freqCode = (long)((double)freq / ((double)clockSpeed / 4.0) * pow(2, 27));
+    
+    // 分解为3个字节并写入寄存器
+    return sendByte(START_FREQ_1, (freqCode >> 16) & 0xFF) &&      // 高字节
+           sendByte(START_FREQ_1 + 1, (freqCode >> 8) & 0xFF) &&   // 中字节
+           sendByte(START_FREQ_1 + 2, freqCode & 0xFF);            // 低字节
+}
+
+/**
+ * @brief 设置频率增量
+ * @details 计算方法与起始频率相同
+ */
+bool AD5933::setIncrementFrequency(unsigned long freq) {
+    long freqCode = (long)((double)freq / ((double)clockSpeed / 4.0) * pow(2, 27));
+    
+    return sendByte(INC_FREQ_1, (freqCode >> 16) & 0xFF) &&
+           sendByte(INC_FREQ_1 + 1, (freqCode >> 8) & 0xFF) &&
+           sendByte(INC_FREQ_1 + 2, freqCode & 0xFF);
+}
+
+/**
+ * @brief 设置频率增量点数
+ * @details 9位数据，范围0-511，写入2个寄存器
+ */
+bool AD5933::setNumberIncrements(unsigned int num) {
+    return sendByte(NUM_INC_1, (num >> 8) & 0x01) &&    // 高位（仅1位有效）
+           sendByte(NUM_INC_1 + 1, num & 0xFF);         // 低8位
+}
+
+/**
+ * @brief 设置PGA增益
+ * @details 修改控制寄存器1的bit0
+ */
+bool AD5933::setPGAGain(byte gain) {
+    byte val;
+    if (getByte(CTRL_REG1, &val) != 0) return false;
+    if (gain == CTRL_PGA_GAIN_X1)
+        val |= CTRL_PGA_GAIN_X1;    // 设置bit0 = x1增益
+    else
+        val &= ~CTRL_PGA_GAIN_X1;   // 清除bit0 = x5增益
+    return sendByte(CTRL_REG1, val);
+}
+
+/**
+ * @brief 设置电源模式
+ * @details 通过控制模式设置电源状态
+ */
+bool AD5933::setPowerMode(byte mode) {
+    return setControlMode(mode);
+}
+
+/**
+ * @brief 读取状态寄存器
+ * @return 状态值，0xFF表示读取失败
+ */
+byte AD5933::readStatusRegister() {
+    byte val;
+    return (getByte(STATUS_REG, &val) == 0) ? val : 0xFF;
+}
+
+// ============================================================
+// 数据采集函数
+// ============================================================
+
+/**
+ * @brief 获取复数阻抗数据
+ * @details 等待数据有效标志，然后读取实部和虚部
+ *          数据为16位有符号整数
+ */
+bool AD5933::getComplexData(int* real, int* imag) {
+    // 等待数据有效（最长1秒超时）
+    int timeout = 1000;
+    while ((readStatusRegister() & STATUS_DATA_VALID) != STATUS_DATA_VALID) {
+        if (--timeout == 0) return false;  // 超时
+        delay(1);
+    }
+    
+    // 读取实部（2字节）
+    byte r1, r2;
+    if (getByte(REAL_DATA_1, &r1) != 0) return false;
+    if (getByte(REAL_DATA_2, &r2) != 0) return false;
+    *real = (int16_t)((r1 << 8) | r2);  // 组合为16位有符号数
+    
+    // 读取虚部（2字节）
+    byte i1, i2;
+    if (getByte(IMAG_DATA_1, &i1) != 0) return false;
+    if (getByte(IMAG_DATA_2, &i2) != 0) return false;
+    *imag = (int16_t)((i1 << 8) | i2);  // 组合为16位有符号数
+    
+    return true;
+}
+
+/**
+ * @brief 执行频率扫描
+ * @details 完整的扫描流程：
+ *          1. 进入待机模式
+ *          2. 初始化起始频率
+ *          3. 开始扫描
+ *          4. 逐点读取数据并增加频率
+ *          5. 返回待机模式
+ */
+bool AD5933::frequencySweep(int real[], int imag[], int n) {
+  if (!setPowerMode(CTRL_STANDBY_MODE)) return false;
+  if (!setControlMode(CTRL_INIT_START_FREQ)) return false;
+  delay(50);  // 100→50ms 关键优化
+  if (!setControlMode(CTRL_START_FREQ_SWEEP)) return false;
+  
+  int i = 0;
+  while (i < n && (readStatusRegister() & STATUS_SWEEP_DONE) != STATUS_SWEEP_DONE) {
+    if (!getComplexData(&real[i], &imag[i])) return false;
+    i++;
+    if (i < n) setControlMode(CTRL_INCREMENT_FREQ);
+  }
+  
+  setPowerMode(CTRL_STANDBY_MODE);
+  return true;
+}
+/**
+ * @brief 基础校准函数
+ * @details 通过已知参考电阻计算增益和相位校准因子
+ *          增益因子 = 1 / (|Z| * Rref)
+ *          相位因子 = arctan(imag/real)
+ */
+bool AD5933::calibrate(double gain[], int phase[], int ref, int n) {
+    int real[n], imag[n];
+    
+    // 执行频率扫描获取原始数据
+    if (!frequencySweep(real, imag, n)) return false;
+    
+    // 计算每个频点的校准因子
+    for (int i = 0; i < n; i++) {
+        // 计算幅值 |Z| = sqrt(real^2 + imag^2)
+        double magnitude = sqrt(pow(real[i], 2) + pow(imag[i], 2));
+        
+        // 增益因子
+        gain[i] = 1.0 / ((double)ref * magnitude);
+        
+        // 相位因子（转换为角度）
+        phase[i] = (int)(atan2(imag[i], real[i]) * 180.0 / M_PI);
+    }
+    return true;
+}
+
+// ============================================================
+// 高级功能函数（用户级接口）
+// ============================================================
+
+/**
+ * @brief 冒泡排序算法
+ * @details 用于测量数据滤波，去除极值点
+ */
+void AD5933::bubbleSort(double arr[], int len) {
+    for (int i = 0; i < len - 1; i++) {
+        for (int j = 0; j < len - i - 1; j++) {
+            if (arr[j] > arr[j + 1]) {
+                // 交换元素
+                double temp = arr[j];
+                arr[j] = arr[j + 1];
+                arr[j + 1] = temp;
+            }
+        }
+    }
+}
+
+/**
+ * @brief 单频校准函数（多次采样平均）
+ * @details 执行流程：
+ *          1. 配置AD5933到指定频率
+ *          2. 执行首次校准
+ *          3. 多次重复校准并累加
+ *          4. 计算平均校准因子
+ */
+bool AD5933::calibrateFrequency(uint32_t freq, int refResistor, int samples, CalData &calData) {
+  // 移除所有 Serial.print
+  
+  reset();
+  setInternalClock(true);
+  setStartFrequency(freq);
+  setIncrementFrequency(1);
+  setNumberIncrements(0);
+  setPGAGain(CTRL_PGA_GAIN_X1);
+  
+  double gain[1];
+  int phase[1];
+  
+  if (!calibrate(gain, phase, refResistor, 1)) {
+    return false;
+  }
+  
+  double gainSum = gain[0];
+  int phaseSum = phase[0];
+  int validCount = 1;
+  
+  for (int n = 0; n < samples - 1; n++) {
+    delay(50);  // 200→50ms
+    if (calibrate(gain, phase, refResistor, 1)) {
+      gainSum += gain[0];
+      phaseSum += phase[0];
+      validCount++;
+    }
+  }
+  
+  calData.gain = gainSum / validCount;
+  calData.phase = phaseSum / validCount;
+  
+  return true;
+}
+/**
+ * @brief 单频阻抗测量（带滤波）
+ * @details 执行流程：
+ *          1. 配置AD5933到指定频率
+ *          2. 多次采样获取原始数据
+ *          3. 使用校准因子计算阻抗和相位
+ *          4. 排序去除极值后取平均
+ */
+bool AD5933::measureImpedance(uint32_t freq, CalData &calData, int samples, double &impedance, double &phase) {
+  reset();
+  setInternalClock(true);
+  setStartFrequency(freq);
+  setIncrementFrequency(1);
+  setNumberIncrements(0);
+  setPGAGain(CTRL_PGA_GAIN_X1);
+  
+  double zArray[samples];
+  double phaseArray[samples];
+  int real[1], imag[1];
+  int valid = 0;
+  
+  for (int i = 0; i < samples; i++) {
+    if (frequencySweep(real, imag, 1)) {
+      double mag = sqrt(real[0] * real[0] + imag[0] * imag[0]);
+      double imp = 1.0 / (mag * calData.gain);
+      double ph = atan2(imag[0], real[0]) * 180.0 / M_PI - calData.phase;
+      
+      zArray[valid] = imp;
+      phaseArray[valid] = ph;
+      valid++;
+    }
+    delay(10);  // 20→10ms
+  }
+  
+  if (valid < 3) return false;
+  
+  bubbleSort(zArray, valid);
+  bubbleSort(phaseArray, valid);
+  
+  double sumZ = 0, sumPh = 0;
+  int count = valid - 2;
+  for (int i = 1; i < valid - 1; i++) {
+    sumZ += zArray[i];
+    sumPh += phaseArray[i];
+  }
+  
+  impedance = sumZ / count;
+  phase = sumPh / count;
+  
+  return true;
+}
+/**
+ * @brief 初始化 AD5933 芯片
+ * @details 复位芯片、设置时钟源和增益
+ */
+bool AD5933::initialize() {
+#if AD5933_DEBUG
+    Serial.println(F("========== AD5933 初始化 =========="));
+#endif
+    
+    // 1. 测试 I2C 通信
+    AD5933_I2C_BUS.beginTransmission(AD5933_ADDR);
+    byte error = AD5933_I2C_BUS.endTransmission();
+    if (error != 0) {
+#if AD5933_DEBUG
+        Serial.print(F("[ERROR] AD5933 未响应 (I2C错误码: "));
+        Serial.print(error);
+        Serial.println(F(")"));
+        Serial.println(F("请检查:"));
+        Serial.println(F("  1. SDA1(D18) 和 SCL1(D19) 接线"));
+        Serial.println(F("  2. AD5933 供电 (3.3V)"));
+        Serial.println(F("  3. I2C 上拉电阻 (2.2kΩ-10kΩ)"));
+#endif
+        return false;
+    }
+#if AD5933_DEBUG
+    Serial.println(F("[OK] AD5933 I2C 通信正常"));
+#endif
+    
+    // 2. 复位芯片
+#if AD5933_DEBUG
+    Serial.println(F("[DEBUG] 复位芯片..."));
+#endif
+    if (!reset()) {
+#if AD5933_DEBUG
+        Serial.println(F("[ERROR] 复位失败"));
+#endif
+        return false;
+    }
+    delay(100);
+    
+    // 3. 设置内部时钟
+#if AD5933_DEBUG
+    Serial.println(F("[DEBUG] 配置内部时钟..."));
+#endif
+    if (!setInternalClock(true)) {
+#if AD5933_DEBUG
+        Serial.println(F("[ERROR] 时钟配置失败"));
+#endif
+        return false;
+    }
+    delay(50);
+    
+    // 4. 设置 PGA 增益
+#if AD5933_DEBUG
+    Serial.println(F("[DEBUG] 设置增益 x1..."));
+#endif
+    if (!setPGAGain(CTRL_PGA_GAIN_X1)) {
+#if AD5933_DEBUG
+        Serial.println(F("[ERROR] 增益配置失败"));
+#endif
+        return false;
+    }
+    delay(50);
+    
+    // 5. 验证状态寄存器
+    byte statusVal = readStatusRegister();
+    if (statusVal == 0xFF) {
+#if AD5933_DEBUG
+        Serial.println(F("[ERROR] 无法读取状态寄存器"));
+#endif
+        return false;
+    }
+#if AD5933_DEBUG
+    Serial.print(F("[DEBUG] 状态寄存器: 0x"));
+    Serial.println(statusVal, HEX);
+    Serial.println(F("[OK] AD5933 初始化完成"));
+#endif
+    
+    return true;
+}
+
+--------------------------------------------------------------------------------
+
+===== AD5933.h =====
+#ifndef AD5933_H
+#define AD5933_H
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// ============================================================
+// 硬件I2C配置（BMduino UNO多路硬件I2C选择）
+// ============================================================
+// BMduino UNO硬件I2C引脚说明：
+// I2C0: SDA0(D20/PD1), SCL0(D21/PD0)  - 默认Wire
+// I2C1: SDA1(D18/PC1), SCL1(D19/PC0)  - Wire1（需要使用时取消注释）
+// ============================================================
+
+// AD5933使用的I2C接口选择
+#define AD5933_I2C_BUS Wire1          // 使用I2C0 (D20/D21)
+// #define AD5933_I2C_BUS Wire1      // 使用I2C1 (D18/D19) - 需要时取消此行注释并注释上一行
+
+// AD5933硬件I2C引脚定义（仅用于文档说明，实际由Wire库控制）
+#define AD5933_SDA_PIN 20            // SDA0 = D20 (PD1)
+#define AD5933_SCL_PIN 21            // SCL0 = D21 (PD0)
+// 如使用Wire1，则为：
+// #define AD5933_SDA_PIN 18         // SDA1 = D18 (PC1)
+// #define AD5933_SCL_PIN 19         // SCL1 = D19 (PC0)
+
+// ============================================================
+// AD5933 I2C地址定义
+// ============================================================
+#define AD5933_ADDR 0x0D             // AD5933的I2C从机地址
+#define ADDR_PTR 0xB0                // 地址指针命令字节
+
+// ============================================================
+// AD5933 寄存器地址映射
+// ============================================================
+#define CTRL_REG1 0x80               // 控制寄存器1（高字节）
+#define CTRL_REG2 0x81               // 控制寄存器2（低字节）
+#define START_FREQ_1 0x82            // 起始频率寄存器（24位，高字节）
+#define INC_FREQ_1 0x85              // 频率增量寄存器（24位，高字节）
+#define NUM_INC_1 0x88               // 增量点数寄存器（9位，高字节）
+#define STATUS_REG 0x8F              // 状态寄存器
+#define REAL_DATA_1 0x94             // 实部数据寄存器（16位，高字节）
+#define REAL_DATA_2 0x95             // 实部数据寄存器（16位，低字节）
+#define IMAG_DATA_1 0x96             // 虚部数据寄存器（16位，高字节）
+#define IMAG_DATA_2 0x97             // 虚部数据寄存器（16位，低字节）
+
+// ============================================================
+// 控制命令定义
+// ============================================================
+#define CTRL_INIT_START_FREQ 0x10    // 初始化起始频率
+#define CTRL_START_FREQ_SWEEP 0x20   // 开始频率扫描
+#define CTRL_INCREMENT_FREQ 0x30     // 增加频率
+#define CTRL_STANDBY_MODE 0xB0       // 待机模式
+#define CTRL_RESET 0x10              // 复位命令
+#define CTRL_CLOCK_INTERNAL 0x00     // 使用内部时钟
+#define CTRL_PGA_GAIN_X1 0x01        // PGA增益设置为x1
+
+// ============================================================
+// 状态寄存器位定义
+// ============================================================
+#define STATUS_DATA_VALID 0x02       // 数据有效标志位
+#define STATUS_SWEEP_DONE 0x04       // 扫描完成标志位
+
+// ============================================================
+// 校准系数宏定义（由AD5933_Calibration.ino校准程序生成）
+// 使用470Ω参考电阻进行校准后将系数粘贴到此处
+// ============================================================
+// 20kHz校准系数
+#define CAL_GAIN_20KHZ  0.0000009992           // 增益校准因子（从串口输出复制）
+#define CAL_PHASE_20KHZ -73             // 相位校准因子（度）（从串口输出复制）
+// 50kHz校准系数
+#define CAL_GAIN_50KHZ  0.0000010037           // 增益校准因子（从串口输出复制）
+#define  CAL_PHASE_50KHZ -54             // 相位校准因子（度）（从串口输出复制）
+// 是否使用宏定义校准（1=使用，0=运行时校准）
+#define USE_CAL_MACROS  1
+
+// ============================================================
+// 频率定义
+// ============================================================
+#define FREQ_20KHZ 20000        // 测量频率1: 20kHz
+#define FREQ_50KHZ 50000        // 测量频率2: 50kHz
+
+// ============================================================
+// 校准数据结构体
+// 用于存储单个频率点的校准系数
+// ============================================================
+struct CalData {
+    double gain;    // 增益校准因子
+    int phase;      // 相位校准因子（度）
+};
+
+// ============================================================
+// AD5933类定义（仅保留实际使用的函数）
+// ============================================================
+class AD5933 {
+public:
+    // ========== 用户级接口函数 ==========
+    
+    /**
+     * @brief 初始化 AD5933 芯片
+     * @return true:成功 false:失败
+     */
+    static bool initialize();
+    
+    /**
+     * @brief 单频校准（多次采样平均）
+     * @param freq 校准频率（Hz）
+     * @param refResistor 参考电阻值（Ω）
+     * @param samples 采样次数
+     * @param calData 校准数据结构体（输出）
+     * @return true:成功 false:失败
+     */
+    static bool calibrateFrequency(uint32_t freq, int refResistor, int samples, CalData &calData);
+    
+    /**
+     * @brief 单频阻抗测量（带滤波）
+     * @param freq 测量频率（Hz）
+     * @param calData 校准数据结构体（输入）
+     * @param samples 采样次数
+     * @param impedance 阻抗值（输出，Ω）
+     * @param phase 相位值（输出，度）
+     * @return true:成功 false:失败
+     */
+    static bool measureImpedance(uint32_t freq, CalData &calData, int samples, double &impedance, double &phase);
+    
+    /**
+     * @brief 冒泡排序（用于数据滤波）
+     * @param arr 待排序数组
+     * @param len 数组长度
+     */
+    static void bubbleSort(double arr[], int len);
+
+private:
+    // ========== 私有常量 ==========
+    static const unsigned long clockSpeed = 16776000;  // 内部时钟频率16.776MHz
+    
+    // ========== 底层I2C通信函数 ==========
+    
+    /**
+     * @brief 从指定寄存器读取一个字节
+     * @param address 寄存器地址
+     * @param value 读取值指针（输出）
+     * @return 0:成功 其他:错误码
+     */
+    static int getByte(byte address, byte* value);
+    
+    /**
+     * @brief 向指定寄存器写入一个字节
+     * @param address 寄存器地址
+     * @param value 写入值
+     * @return true:成功 false:失败
+     */
+    static bool sendByte(byte address, byte value);
+    
+    // ========== 基础配置函数 ==========
+    
+    /**
+     * @brief 复位AD5933芯片
+     * @return true:成功 false:失败
+     */
+    static bool reset();
+    
+    /**
+     * @brief 设置时钟源
+     * @param internal true:使用内部时钟 false:使用外部时钟
+     * @return true:成功 false:失败
+     */
+    static bool setInternalClock(bool internal);
+    
+    /**
+     * @brief 设置起始频率
+     * @param freq 起始频率（Hz）
+     * @return true:成功 false:失败
+     */
+    static bool setStartFrequency(unsigned long freq);
+    
+    /**
+     * @brief 设置频率增量
+     * @param freq 频率增量（Hz）
+     * @return true:成功 false:失败
+     */
+    static bool setIncrementFrequency(unsigned long freq);
+    
+    /**
+     * @brief 设置频率增量点数
+     * @param num 增量点数（0-511）
+     * @return true:成功 false:失败
+     */
+    static bool setNumberIncrements(unsigned int num);
+    
+    /**
+     * @brief 设置PGA增益
+     * @param gain CTRL_PGA_GAIN_X1 或 CTRL_PGA_GAIN_X5
+     * @return true:成功 false:失败
+     */
+    static bool setPGAGain(byte gain);
+    
+    /**
+     * @brief 读取状态寄存器
+     * @return 状态寄存器值
+     */
+    static byte readStatusRegister();
+    
+    /**
+     * @brief 获取复数阻抗数据（实部+虚部）
+     * @param real 实部数据指针（输出）
+     * @param imag 虚部数据指针（输出）
+     * @return true:成功 false:超时或失败
+     */
+    static bool getComplexData(int* real, int* imag);
+    
+    /**
+     * @brief 设置控制模式
+     * @param mode 控制模式命令字节
+     * @return true:成功 false:失败
+     */
+    static bool setControlMode(byte mode);
+    
+    /**
+     * @brief 设置电源模式
+     * @param mode 电源模式命令
+     * @return true:成功 false:失败
+     */
+    static bool setPowerMode(byte mode);
+    
+    // ========== 测量与校准函数 ==========
+    
+    /**
+     * @brief 执行频率扫描
+     * @param real 实部数据数组（输出）
+     * @param imag 虚部数据数组（输出）
+     * @param n 扫描点数
+     * @return true:成功 false:失败
+     */
+    static bool frequencySweep(int real[], int imag[], int n);
+    
+    /**
+     * @brief 基础校准函数（单次扫描）
+     * @param gain 增益数组（输出）
+     * @param phase 相位数组（输出）
+     * @param ref 参考电阻值（Ω）
+     * @param n 扫描点数
+     * @return true:成功 false:失败
+     */
+    static bool calibrate(double gain[], int phase[], int ref, int n);
+};
+
+#endif
+
+--------------------------------------------------------------------------------
+
+===== BM53_Protocol.cpp =====
+#include "BM53_Protocol.h"
+#include "TimeStamp.h"  // ★ 时间戳模块
+
+// ============================================================
+// 构造函数
+// ============================================================
+BM53_Protocol::BM53_Protocol(HardwareSerial& serial)
+    : _serial(serial)
+    , _debugStream(&Serial)
+    , _ringHead(0)
+    , _ringTail(0)
+    , _queueHead(0)
+    , _queueTail(0)
+    , _lastSendTime(0)
+    , _sendInterval(BM53_SEND_INTERVAL_MS)
+    , _queueDropped(0)
+    , _totalBytesReceived(0)
+    , _totalBytesSent(0)
+    , _totalFramesParsed(0)
+    , _totalFramesSent(0)
+    , _totalCrcErrors(0)
+    , _lastHeartbeatTime(0)
+    , _heartbeatTimeout(8000)
+    , _debugEnable(false)
+    , _timestampEnabled(true)
+    , _globalCallback(nullptr)
+{
+    memset(_cmdCallbacks, 0, sizeof(_cmdCallbacks));
+    for (int i = 0; i < BM53_SEND_QUEUE_SIZE; i++) {
+        _sendQueue[i].valid = false;
+    }
+}
+
+// ============================================================
+// 初始化
+// ============================================================
+void BM53_Protocol::begin(unsigned long baudRate) {
+    _serial.begin(baudRate);
+    _ringHead = _ringTail = 0;
+    _queueHead = _queueTail = 0;
+    _lastHeartbeatTime = millis();
+    _lastSendTime = millis();
+
+    if (_debugEnable && _debugStream) {
+        _debugStream->println(F("[BM53] 协议库初始化完成"));
+        _debugStream->print(F("[BM53] 波特率: "));
+        _debugStream->println(baudRate);
+        _debugStream->print(F("[BM53] 发送间隔: "));
+        _debugStream->print(_sendInterval);
+        _debugStream->println(F("ms"));
+    }
+}
+
+// ============================================================
+// 主循环
+// ============================================================
+void BM53_Protocol::loop() {
+    _readToRingBuffer();
+    _extractFrame();
+    _processSendQueue();
+}
+
+// ============================================================
+// 发送队列处理
+// ============================================================
+void BM53_Protocol::_processSendQueue() {
+    unsigned long now = millis();
+
+    if (now - _lastSendTime < _sendInterval) return;
+    if (_queueHead == _queueTail) return;
+
+    SendQueueItem& item = _sendQueue[_queueHead];
+    if (!item.valid) {
+        _queueHead = (_queueHead + 1) % BM53_SEND_QUEUE_SIZE;
+        return;
+    }
+
+    _serial.write(item.frame, item.frameLen);
+    _totalBytesSent += item.frameLen;
+    _totalFramesSent++;
+
+    item.valid = false;
+    _queueHead = (_queueHead + 1) % BM53_SEND_QUEUE_SIZE;
+    _lastSendTime = now;
+}
+
+// ============================================================
+// 将帧加入队列
+// ============================================================
+bool BM53_Protocol::_queueFrame(byte* frame, int len) {
+    int nextTail = (_queueTail + 1) % BM53_SEND_QUEUE_SIZE;
+
+    if (nextTail == _queueHead) {
+        _queueDropped++;
+        if (_debugEnable && _debugStream) {
+            _debugStream->println(F("[BM53] 警告: 发送队列满，丢弃数据"));
+        }
+        _sendQueue[_queueHead].valid = false;
+        _queueHead = (_queueHead + 1) % BM53_SEND_QUEUE_SIZE;
+    }
+
+    SendQueueItem& item = _sendQueue[_queueTail];
+    memcpy(item.frame, frame, len);
+    item.frameLen = len;
+    item.valid = true;
+    _queueTail = nextTail;
+
+    return true;
+}
+
+// ============================================================
+// 设置发送间隔
+// ============================================================
+void BM53_Protocol::setSendInterval(unsigned long intervalMs) {
+    _sendInterval = intervalMs;
+}
+
+// ============================================================
+// 立即发送队列中所有数据
+// ============================================================
+void BM53_Protocol::flushSendQueue() {
+    while (_queueHead != _queueTail) {
+        SendQueueItem& item = _sendQueue[_queueHead];
+        if (item.valid) {
+            _serial.write(item.frame, item.frameLen);
+            _totalBytesSent += item.frameLen;
+            _totalFramesSent++;
+            item.valid = false;
+        }
+        _queueHead = (_queueHead + 1) % BM53_SEND_QUEUE_SIZE;
+    }
+    _lastSendTime = millis();
+}
+
+// ============================================================
+// 获取队列中的数据包数量
+// ============================================================
+int BM53_Protocol::getQueueCount() {
+    return (_queueTail - _queueHead + BM53_SEND_QUEUE_SIZE) % BM53_SEND_QUEUE_SIZE;
+}
+
+// ============================================================
+// 清空发送队列
+// ============================================================
+void BM53_Protocol::clearSendQueue() {
+    while (_queueHead != _queueTail) {
+        _sendQueue[_queueHead].valid = false;
+        _queueHead = (_queueHead + 1) % BM53_SEND_QUEUE_SIZE;
+    }
+    _queueDropped = 0;
+}
+
+// ============================================================
+// 注册回调
+// ============================================================
+void BM53_Protocol::onCommand(CommandCallback callback) {
+    _globalCallback = callback;
+}
+
+void BM53_Protocol::onCommand(byte cmd, CommandCallback callback) {
+    if (cmd < 256) {
+        _cmdCallbacks[cmd] = callback;
+    }
+}
+
+// ============================================================
+// 连接状态
+// ============================================================
+bool BM53_Protocol::isConnected() const {
+    return (millis() - _lastHeartbeatTime) < _heartbeatTimeout;
+}
+
+// ============================================================
+// 读取到环形缓冲区
+// ============================================================
+void BM53_Protocol::_readToRingBuffer() {
+    int available = _serial.available();
+    if (available <= 0) return;
+
+    _totalBytesReceived += available;
+
+    int space = (RING_SIZE + _ringTail - _ringHead - 1) % RING_SIZE;
+    if (space < available) {
+        _ringTail = (_ringTail + available - space) % RING_SIZE;
+    }
+
+    int toRead = min(available, space);
+
+    if (_ringHead + toRead <= RING_SIZE) {
+        _serial.readBytes(_ringBuffer + _ringHead, toRead);
+    } else {
+        int firstPart = RING_SIZE - _ringHead;
+        _serial.readBytes(_ringBuffer + _ringHead, firstPart);
+        _serial.readBytes(_ringBuffer, toRead - firstPart);
+    }
+
+    _ringHead = (_ringHead + toRead) % RING_SIZE;
+}
+
+// ============================================================
+// 提取帧
+// ============================================================
+void BM53_Protocol::_extractFrame() {
+    static byte frameBuffer[BM53_MAX_FRAME_SIZE];
+    static int frameIdx = 0;
+    static uint16_t expectedLen = 0;
+
+    while (_ringTail != _ringHead) {
+        byte b = _ringBuffer[_ringTail];
+        _ringTail = (_ringTail + 1) % RING_SIZE;
+
+        if (frameIdx == 0) {
+            if (b == BM53_FRAME_H1) {
+                frameBuffer[frameIdx++] = b;
+            }
+            continue;
+        }
+
+        if (frameIdx == 1) {
+            if (b == BM53_FRAME_H2) {
+                frameBuffer[frameIdx++] = b;
+            } else {
+                frameIdx = 0;
+            }
+            continue;
+        }
+
+        if (frameIdx < BM53_MAX_FRAME_SIZE) {
+            frameBuffer[frameIdx++] = b;
+        } else {
+            frameIdx = 0;
+            continue;
+        }
+
+        if (frameIdx == 4) {
+            expectedLen = frameBuffer[2] | (frameBuffer[3] << 8);
+            expectedLen = 2 + 2 + expectedLen + 2 + 1;
+
+            if (expectedLen > BM53_MAX_FRAME_SIZE) {
+                frameIdx = 0;
+                continue;
+            }
+        }
+
+        if (frameIdx >= 7 && frameIdx == expectedLen) {
+            if (frameBuffer[frameIdx - 1] == BM53_FRAME_TAIL &&
+                frameBuffer[0] == BM53_FRAME_H1 &&
+                frameBuffer[1] == BM53_FRAME_H2) {
+
+                _parseFrame(frameBuffer, frameIdx);
+            }
+            frameIdx = 0;
+            break;
+        }
+    }
+}
+
+// ============================================================
+// ★ 解析接收帧中的时间戳，返回时间戳占用的字节数
+// ============================================================
+byte BM53_Protocol::_parseTimestamp(const byte* buf, uint16_t dataLen) {
+    // dataLen 包含 dir(1) 后面的数据部分
+    // 接收帧格式: H1(1) H2(1) dataLen(2) cmd(1) dir(1) [timestamp?] payload... CRC(2) tail(1)
+    // 数据区 = cmd + dir + payload，dataLen = 2 + payloadLen [+ timestampLen]
+    //
+    // 如果 dataLen > 2，说明有payload，前1字节可能是时间戳flag
+    // 如果前1字节是 0x01 或 0x00，且后面有足够数据，就是时间戳
+    
+    if (dataLen <= 2) return 0;  // 无payload，无时间戳
+    
+    // 时间戳在 dir(1) 之后的第一个字节
+    byte flag = buf[7];  // buf[6]是dir, buf[7]是第一个数据字节
+    
+    if (flag == TIMESTAMP_FLAG_ABS && dataLen >= 1 + 8 + 1) {
+        // 绝对时间：flag(1) + timestamp(8) + 至少1字节数据
+        return TIMESTAMP_LEN_ABS;  // 9
+    } else if (flag == TIMESTAMP_FLAG_REL && dataLen >= 1 + 4 + 1) {
+        // 相对时间：flag(1) + timestamp(4) + 至少1字节数据
+        return TIMESTAMP_LEN_REL;  // 5
+    }
+    
+    return 0;  // 不是时间戳，不是标准数据帧，不跳过
+}
+
+// ============================================================
+// 解析帧
+// ============================================================
+void BM53_Protocol::_parseFrame(byte* buf, int len) {
+    if (buf[0] != BM53_FRAME_H1 || buf[1] != BM53_FRAME_H2 ||
+        buf[len-1] != BM53_FRAME_TAIL) {
+        return;
+    }
+
+    uint16_t dataLen = buf[2] | (buf[3] << 8);
+    byte cmd = buf[4];
+    byte dir = buf[5];
+
+    // CRC校验
+    int crcPos = len - 3;
+    uint16_t rcvCrc = buf[crcPos] | (buf[crcPos + 1] << 8);
+    uint16_t calCrc = crc16(buf + 4, dataLen);
+
+    if (_debugEnable && _debugStream) {
+        _debugStream->print(F("<< [解析] "));
+        _debugStream->print(_getCmdName(cmd));
+        _debugStream->print(F(" CRC:"));
+        _debugStream->println(rcvCrc == calCrc ? F("正确") : F("错误"));
+    }
+
+    if (rcvCrc != calCrc) {
+        _totalCrcErrors++;
+        return;
+    }
+
+    _totalFramesParsed++;
+
+    // 心跳特殊处理
+    if (cmd == BM53_CMD_HEARTBEAT) {
+        _lastHeartbeatTime = millis();
+        sendHeartbeat();
+    }
+
+    // ★ 调用回调：跳过时间戳，只传实际数据
+    byte* dataPtr = nullptr;
+    uint16_t payloadLen = 0;
+
+    if (dataLen > 2) {
+        byte tsLen = _parseTimestamp(buf, dataLen);
+        // 数据起始位置: buf[6] = dir, buf[7] = 第一个数据字节
+        dataPtr = buf + 6 + tsLen;
+        payloadLen = dataLen - 2 - tsLen;  // 减去 dir(1) + cmd(1) 已在dataLen计算中的dir
+    }
+
+    if (_cmdCallbacks[cmd]) {
+        _cmdCallbacks[cmd](cmd, dataPtr, payloadLen);
+    }
+
+    if (_globalCallback) {
+        _globalCallback(cmd, dataPtr, payloadLen);
+    }
+}
+
+// ============================================================
+// ★ 内部发送函数：统一写串口，所有有数据的帧都加时间戳
+// ============================================================
+bool BM53_Protocol::_sendFrameInternal(byte cmd, byte* data, uint16_t dataLen) {
+    byte frame[BM53_MAX_FRAME_SIZE];
+    int idx = 0;
+
+    frame[idx++] = BM53_FRAME_H1;
+    frame[idx++] = BM53_FRAME_H2;
+
+    // ★ 时间戳插入：所有有数据的帧统一加时间戳
+    uint8_t tsLen = 0;
+    byte tsBuf[9];
+    if (_timestampEnabled && data != nullptr && dataLen > 0) {
+        tsLen = systemTime.getTimestampBytes(tsBuf);
+    }
+
+    uint16_t dataArea = 2 + tsLen + dataLen;
+    frame[idx++] = dataArea & 0xFF;
+    frame[idx++] = dataArea >> 8;
+
+    frame[idx++] = cmd;
+    frame[idx++] = BM53_DIR_DEV2UP;
+
+    // ★ 插入时间戳
+    if (tsLen > 0) {
+        memcpy(frame + idx, tsBuf, tsLen);
+        idx += tsLen;
+    }
+
+    if (data != nullptr && dataLen > 0) {
+        memcpy(frame + idx, data, dataLen);
+        idx += dataLen;
+    }
+
+    uint16_t crc = crc16(frame + 4, dataArea);
+    frame[idx++] = crc & 0xFF;
+    frame[idx++] = crc >> 8;
+    frame[idx++] = BM53_FRAME_TAIL;
+
+    // 加入发送队列
+    return _queueFrame(frame, idx);
+}
+
+// ============================================================
+// 公共发送接口
+// ============================================================
+bool BM53_Protocol::sendFrame(byte cmd, byte* data, uint16_t dataLen) {
+    return _sendFrameInternal(cmd, data, dataLen);
+}
+
+void BM53_Protocol::sendAck() {
+    _sendFrameInternal(BM53_CMD_ACK, nullptr, 0);
+}
+
+void BM53_Protocol::sendNak() {
+    _sendFrameInternal(BM53_CMD_NAK, nullptr, 0);
+}
+
+void BM53_Protocol::sendResponse(byte cmd, byte result, byte error) {
+    byte buf[2] = {result, error};
+    _sendFrameInternal(cmd, buf, 2);
+}
+
+void BM53_Protocol::sendHeartbeat() {
+    _sendFrameInternal(BM53_CMD_HEARTBEAT, nullptr, 0);
+}
+
+void BM53_Protocol::sendDeviceInfo(const char* devName, const char* firmVer) {
+    byte buf[30];
+    memset(buf, 0, 30);
+    strncpy((char*)buf, devName, 15);
+    strncpy((char*)buf + 15, firmVer, 15);
+    _sendFrameInternal(BM53_CMD_DEV_INFO, buf, 30);
+}
+
+void BM53_Protocol::sendPressureData(byte sensorId, float currentValue,
+                                      float maxValue, float threshold, byte alertFlag) {
+    byte buf[14];
+    buf[0] = sensorId;
+    memcpy(buf + 1, &currentValue, 4);
+    memcpy(buf + 5, &maxValue, 4);
+    memcpy(buf + 9, &threshold, 4);
+    buf[13] = alertFlag;
+    _sendFrameInternal(BM53_CMD_PRESSURE, buf, 14);
+}
+
+void BM53_Protocol::sendEdemaData(byte channelId, float impedance,
+                                   float edemaPercent, byte alert) {
+    byte buf[10];
+    buf[0] = channelId;
+    memcpy(buf + 1, &impedance, 4);
+    memcpy(buf + 5, &edemaPercent, 4);
+    buf[9] = alert;
+    _sendFrameInternal(BM53_CMD_EDEMA, buf, 10);
+}
+
+void BM53_Protocol::sendProgressData(byte percent, uint16_t elapsedSeconds,
+                                      uint16_t remainingSeconds) {
+    byte buf[5] = {
+        percent,
+        (byte)(elapsedSeconds & 0xFF),
+        (byte)(elapsedSeconds >> 8),
+        (byte)(remainingSeconds & 0xFF),
+        (byte)(remainingSeconds >> 8)
+    };
+    _sendFrameInternal(BM53_CMD_PROGRESS, buf, 5);
+}
+
+void BM53_Protocol::sendMotorStatus(byte stepper1State, byte stepper2State,
+                                     uint16_t stepper1Speed, uint16_t stepper2Speed,
+                                     byte* servoAngles, byte servoCount) {
+    byte buf[12];
+    int idx = 0;
+    buf[idx++] = stepper1State;
+    buf[idx++] = stepper2State;
+    buf[idx++] = stepper1Speed & 0xFF;
+    buf[idx++] = stepper1Speed >> 8;
+    buf[idx++] = stepper2Speed & 0xFF;
+    buf[idx++] = stepper2Speed >> 8;
+    for (byte i = 0; i < servoCount && i < 6; i++) {
+        buf[idx++] = servoAngles[i];
+    }
+    _sendFrameInternal(BM53_CMD_MOTOR_STATUS, buf, idx);
+}
+
+void BM53_Protocol::sendPressureDataBatch(byte sensorCount, const byte* sensorIds,
+                                          const float* currentValues, const float* maxValues,
+                                          const float* thresholds, const byte* alertFlags) {
+    const int recordLength = 14;
+    const int MAX_PRESSURE_BUF = 1 + 8 * recordLength;
+    byte buf[MAX_PRESSURE_BUF];
+    uint16_t dataLen = 1 + sensorCount * recordLength;
+
+    buf[0] = sensorCount;
+
+    for (byte i = 0; i < sensorCount; i++) {
+        int offset = 1 + i * recordLength;
+        buf[offset] = sensorIds[i];
+        memcpy(buf + offset + 1, &currentValues[i], 4);
+        memcpy(buf + offset + 5, &maxValues[i], 4);
+        memcpy(buf + offset + 9, &thresholds[i], 4);
+        buf[offset + 13] = alertFlags[i];
+    }
+
+    _sendFrameInternal(BM53_CMD_PRESSURE, buf, dataLen);
+}
+
+// ============================================================
+// CRC16计算
+// ============================================================
+uint16_t BM53_Protocol::crc16(byte* data, int len) {
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 1) {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+// ============================================================
+// 辅助函数
+// ============================================================
+const char* BM53_Protocol::_getCmdName(byte cmd) {
+    switch(cmd) {
+        case BM53_CMD_HEARTBEAT:     return "心跳";
+        case BM53_CMD_HANDSHAKE:     return "握手";
+        case BM53_CMD_DEV_INFO:      return "设备信息";
+        case BM53_CMD_START_THERAPY: return "开始治疗";
+        case BM53_CMD_STOP_THERAPY:  return "停止治疗";
+        case BM53_CMD_EME_STOP:      return "紧急停止";
+        case BM53_CMD_PAUSE_THERAPY:   return "暂停治疗";
+        case BM53_CMD_RESUME_THERAPY:  return "继续治疗";
+        case BM53_CMD_EXIT_EME_STOP:   return "退出急停";
+        case BM53_CMD_SET_MODE:      return "设置模式";
+        case BM53_CMD_SET_INTENSITY: return "设置强度";
+        case BM53_CMD_SET_DURATION:  return "设置时长";
+        case BM53_CMD_STEPPER_CTRL:  return "步进电机";
+        case BM53_CMD_SERVO_CTRL:    return "舵机控制";
+        case BM53_CMD_SERVO_HOME:    return "舵机归位";
+        case BM53_CMD_MOTOR_HOME:      return "电机回零";
+        case BM53_CMD_MOTOR_STEP:      return "电机步进";
+        case BM53_CMD_MOTOR_POSITION:  return "读取位置";
+        case BM53_CMD_SET_TIME:        return "设置时间";
+        case BM53_CMD_PRESSURE:      return "压力数据";
+        case BM53_CMD_EDEMA:         return "水肿数据";
+        case BM53_CMD_MOTOR_STATUS:  return "电机状态";
+        case BM53_CMD_PROGRESS:      return "治疗进度";
+        case BM53_CMD_ACK:           return "ACK";
+        case BM53_CMD_NAK:           return "NAK";
+        default:                     return "未知";
+    }
+}
+
+void BM53_Protocol::_printHex(byte b) {
+    if (!_debugStream) return;
+    if (b < 0x10) _debugStream->print('0');
+    _debugStream->print(b, HEX);
+}
+
+void BM53_Protocol::_printHexArray(byte* data, int len, int maxPrint) {
+    if (!_debugStream) return;
+    int printLen = min(len, maxPrint);
+    for (int i = 0; i < printLen; i++) {
+        if (i > 0) _debugStream->print(' ');
+        _printHex(data[i]);
+    }
+    if (len > maxPrint) {
+        _debugStream->print(F(" ... (共"));
+        _debugStream->print(len);
+        _debugStream->print(F("字节)"));
+    }
+}
+
+void BM53_Protocol::_printTimestamp() {
+    if (!_debugStream) return;
+    unsigned long t = millis();
+    _debugStream->print('[');
+    _debugStream->print(t / 1000);
+    _debugStream->print('.');
+    if (t % 1000 < 100) _debugStream->print('0');
+    if (t % 1000 < 10) _debugStream->print('0');
+    _debugStream->print(t % 1000);
+    _debugStream->print(F("] "));
+}
+
+--------------------------------------------------------------------------------
+
+===== BM53_Protocol.h =====
+// BM53_Protocol.h
+#ifndef BM53_PROTOCOL_H
+#define BM53_PROTOCOL_H
+
+#include <Arduino.h>
+#include "TimeStamp.h"  // ★ 时间戳模块
+
+// ============================================================
+// 协议常量
+// ============================================================
+#define BM53_FRAME_H1      0xAA
+#define BM53_FRAME_H2      0x55
+#define BM53_FRAME_TAIL    0x0D
+#define BM53_DIR_UP2DEV    0x00
+#define BM53_DIR_DEV2UP    0x01
+
+// 命令码
+#define BM53_CMD_HEARTBEAT     0x01
+#define BM53_CMD_HANDSHAKE     0x02
+#define BM53_CMD_DEV_INFO      0x03
+#define BM53_CMD_DISCOVERY_REQ 0x04
+#define BM53_CMD_DISCOVERY_RES 0x05
+
+#define BM53_CMD_START_THERAPY  0x10
+#define BM53_CMD_STOP_THERAPY   0x11
+#define BM53_CMD_EME_STOP       0x12
+#define BM53_CMD_SET_MODE       0x13
+#define BM53_CMD_SET_INTENSITY  0x14
+#define BM53_CMD_SET_DURATION   0x15
+#define BM53_CMD_PAUSE_THERAPY   0x16   // 暂停治疗
+#define BM53_CMD_RESUME_THERAPY  0x17   // 继续治疗
+#define BM53_CMD_EXIT_EME_STOP   0x18   // 退出急停状态
+
+#define BM53_CMD_STEPPER_CTRL   0x30
+#define BM53_CMD_SERVO_CTRL     0x31
+#define BM53_CMD_SERVO_HOME     0x32
+#define BM53_CMD_MOTOR_HOME      0x33   // 电机回零
+#define BM53_CMD_MOTOR_STEP      0x34   // 电机步进（单步移动）
+#define BM53_CMD_MOTOR_POSITION  0x35   // 读取电机当前位置
+#define BM53_CMD_SET_TIME        0x36   // ★ 设置系统时间（上位机发NTP时间）
+
+#define BM53_CMD_PRESSURE       0x50
+#define BM53_CMD_EDEMA          0x51
+#define BM53_CMD_MOTOR_STATUS   0x52
+#define BM53_CMD_PROGRESS       0x53
+
+#define BM53_CMD_ACK            0x80
+#define BM53_CMD_NAK            0x81
+
+
+// 最大帧长度
+#define BM53_MAX_FRAME_SIZE 256
+
+// ============================================================
+// 发送队列配置
+// ============================================================
+#define BM53_SEND_QUEUE_SIZE 32        // 发送队列最大容量
+#define BM53_SEND_INTERVAL_MS 50       // 发送间隔（毫秒）
+
+// 队列项结构
+struct SendQueueItem {
+    byte frame[BM53_MAX_FRAME_SIZE];   // 完整帧数据
+    int frameLen;                      // 帧长度
+    bool valid;                        // 是否有效
+};
+
+// ============================================================
+// 回调函数类型定义
+// ============================================================
+typedef void (*CommandCallback)(byte cmd, byte* data, uint16_t dataLen);
+
+// ============================================================
+// BM53_Protocol 类
+// ============================================================
+class BM53_Protocol {
+public:
+    // 构造函数
+    BM53_Protocol(HardwareSerial& serial = Serial2);
+    
+    // 初始化和主循环
+    void begin(unsigned long baudRate = 460800);
+    void loop();
+    
+    // 注册回调
+    void onCommand(CommandCallback callback);
+    void onCommand(byte cmd, CommandCallback callback);
+    
+    // 发送帧（所有帧统一写串口，时间戳由WiFi模块决定）
+    bool sendFrame(byte cmd, byte* data = nullptr, uint16_t dataLen = 0);
+    void sendAck();
+    void sendNak();
+    void sendResponse(byte cmd, byte result, byte error = 0);
+    
+    // 便捷发送函数
+    void sendHeartbeat();
+    void sendDeviceInfo(const char* devName, const char* firmVer);
+    void sendPressureData(byte sensorId, float currentValue, float maxValue, 
+                          float threshold, byte alertFlag);
+    void sendEdemaData(byte channelId, float impedance, float edemaPercent, byte alert);
+    void sendProgressData(byte percent, uint16_t elapsedSeconds, uint16_t remainingSeconds);
+    void sendMotorStatus(byte stepper1State, byte stepper2State,
+                         uint16_t stepper1Speed, uint16_t stepper2Speed,
+                         byte* servoAngles, byte servoCount);
+    
+    // 发送队列控制
+    void setSendInterval(unsigned long intervalMs);
+    void flushSendQueue();
+    int getQueueCount();
+    void clearSendQueue();
+    
+    // 获取统计信息
+    unsigned long getBytesReceived() const { return _totalBytesReceived; }
+    unsigned long getBytesSent() const { return _totalBytesSent; }
+    unsigned long getFramesParsed() const { return _totalFramesParsed; }
+    unsigned long getFramesSent() const { return _totalFramesSent; }
+    unsigned long getCrcErrors() const { return _totalCrcErrors; }
+    unsigned long getLastHeartbeatTime() const { return _lastHeartbeatTime; }
+    unsigned long getQueueDropped() const { return _queueDropped; }
+
+    // 批量发送函数
+    void sendPressureDataBatch(byte sensorCount, const byte* sensorIds, 
+                           const float* currentValues, const float* maxValues, 
+                           const float* thresholds, const byte* alertFlags);
+    
+    // 连接状态
+    bool isConnected() const;
+    void setHeartbeatTimeout(unsigned long timeoutMs) { _heartbeatTimeout = timeoutMs; }
+    
+    // 调试开关
+    void setDebug(bool enable) { _debugEnable = enable; }
+    void setDebugStream(Stream* stream) { _debugStream = stream; }
+    
+    // CRC计算（静态方法，供外部使用）
+    static uint16_t crc16(byte* data, int len);
+
+    // ★ 时间戳控制
+    void enableTimestamp(bool enable) { _timestampEnabled = enable; }
+    bool isTimestampEnabled() const { return _timestampEnabled; }
+
+private:
+    // 串口引用
+    HardwareSerial& _serial;
+    Stream* _debugStream;
+    
+    // 环形缓冲区
+    static const int RING_SIZE = 1024;
+    byte _ringBuffer[RING_SIZE];
+    volatile int _ringHead;
+    volatile int _ringTail;
+    
+    // 发送队列
+    SendQueueItem _sendQueue[BM53_SEND_QUEUE_SIZE];
+    volatile int _queueHead;
+    volatile int _queueTail;
+    unsigned long _lastSendTime;
+    unsigned long _sendInterval;
+    unsigned long _queueDropped;
+    
+    // 统计信息
+    unsigned long _totalBytesReceived;
+    unsigned long _totalBytesSent;
+    unsigned long _totalFramesParsed;
+    unsigned long _totalFramesSent;
+    unsigned long _totalCrcErrors;
+    unsigned long _lastHeartbeatTime;
+    unsigned long _heartbeatTimeout;
+    
+    // 配置
+    bool _debugEnable;
+    bool _timestampEnabled;
+
+    // 回调
+    CommandCallback _globalCallback;
+    CommandCallback _cmdCallbacks[256];
+    
+    // 内部方法
+    void _readToRingBuffer();
+    void _extractFrame();
+    void _parseFrame(byte* frame, int len);
+    bool _sendFrameInternal(byte cmd, byte* data, uint16_t dataLen);
+    void _processSendQueue();
+    bool _queueFrame(byte* frame, int len);
+    void _printHex(byte b);
+    void _printHexArray(byte* data, int len, int maxPrint = 32);
+    void _printTimestamp();
+    const char* _getCmdName(byte cmd);
+    // ★ 解析接收帧中的时间戳，返回跳过的字节数
+    byte _parseTimestamp(const byte* buf, uint16_t dataLen);
+};
+
+#endif // BM53_PROTOCOL_H
+
+--------------------------------------------------------------------------------
+
+===== config.h =====
+/*
+ * ================================================================
+ * config.h — 用户配置文件 (优化版)
+ * ================================================================
+ */
+
+#ifndef CONFIG_H
+#define CONFIG_H
+
+// =================================================================
+// 硬件配置
+// =================================================================
+
+// 使用通道数 (1~8)
+#define USE_CHANNELS 6
+
+// 传感器量程 (克)
+#define FORCE_MIN 50
+#define FORCE_MAX 2000
+
+// 底噪阈值
+#define BASELINE_AD 12
+
+// =================================================================
+// 滤波配置
+// =================================================================
+
+// 滑动平均滤波窗口大小 (建议 3~10)
+#define FILTER_SIZE 5
+
+// =================================================================
+// 显示配置
+// =================================================================
+
+// 串口波特率 (建议 115200 提高传输速度)
+#define DEBUG_BAUD 115200
+
+// 输出刷新间隔 (毫秒) - 20Hz = 50ms, 10Hz = 100ms
+#define PRINT_INTERVAL 50
+
+// 是否显示原始AD值 (true/false)
+#define SHOW_RAW_AD true
+
+// 是否启用统计功能 (true/false)
+#define ENABLE_STATS true
+
+// 统计信息显示间隔 (毫秒)
+#define STATS_INTERVAL 10000
+
+// =================================================================
+// 校准表配置 ★★★ 需要实际测量填写 ★★★
+// =================================================================
+
+// 校准点数量（必须与下面数组的实际元素个数一致！）
+#define CAL_POINTS 7
+
+// 校准点：AD值（必须从小到大排列）
+const uint16_t CAL_AD[] = { 
+    10,    // 空载
+    300,   // 50g
+    900,   // 100g
+    1600,  // 200g
+    2500,  // 500g
+    3000,  // 1000g
+    3400   // 2000g
+};
+
+// 校准点：对应压力值(克)
+const uint16_t CAL_FORCE[] = { 
+    0, 
+    50, 
+    100, 
+    200, 
+    500, 
+    1000, 
+    2000 
+};
+
+// =================================================================
+// 高级配置
+// =================================================================
+
+// 是否打印原始十六进制数据 (调试用)
+#define PRINT_RAW_HEX false
+
+// ===================================================================
+// 注意：请确保 CAL_AD 和 CAL_FORCE 数组的元素个数等于 CAL_POINTS
+// 如果不一致，程序会在运行时通过 validateCalibration() 检测
+// ===================================================================
+
+#endif // CONFIG_H
+
+--------------------------------------------------------------------------------
+
+===== DataReporter.cpp =====
+/*
+ * ================================================================
+ * DataReporter.cpp — 数据上报模块实现
+ * ================================================================
+ */
+
+#include "DataReporter.h"
+
+// ============================================================
+// 构造函数
+// ============================================================
+DataReporter::DataReporter(BM53_Protocol* protocol, ServoController* servo)
+    : _protocol(protocol)
+    , _servo(servo)
+    , _lastPressureReport(0)
+    , _lastEdemaReport(0)
+    , _lastProgressReport(0)
+    , _lastMotorReport(0)
+    , _pressureDataChanged(false)
+    , _motorStatusChanged(false)
+    , _totalReports(0)
+{
+    // 初始化上次上报值数组
+    for (int i = 0; i < USE_CHANNELS; i++) {
+        _lastReportedForce[i] = 0;
+        _forceWasNonZero[i] = false;
+    }
+}
+
+// ============================================================
+// 初始化
+// ============================================================
+void DataReporter::begin() {
+    unsigned long now = millis();
+    _lastPressureReport = now;
+    _lastEdemaReport = now;
+    _lastProgressReport = now;
+    _lastMotorReport = now;
+    _pressureDataChanged = true;
+    _motorStatusChanged = true;
+}
+
+// ============================================================
+// 主更新函数
+// ============================================================
+void DataReporter::update(long* forceValues,
+                          bool isTherapyActive,
+                          bool motorState,
+                          unsigned long therapyStartTime,
+                          unsigned long therapyEndTime,
+                          uint16_t therapyDuration,
+                          bool bioCalSuccess,
+                          double z20k,
+                          double z50k)
+{
+    // 检查连接状态
+    if (!_protocol->isConnected()) {
+        return;
+    }
+
+    unsigned long currentTime = millis();
+
+    // ========== 压力数据上报 ==========
+    if (currentTime - _lastPressureReport >= REPORT_PRESSURE_INTERVAL || _pressureDataChanged) {
+        _reportAllPressureData(forceValues);
+        _lastPressureReport = currentTime;
+        _pressureDataChanged = false;
+        _totalReports++;
+    }
+
+    // ========== 水肿数据上报 ==========
+    if (currentTime - _lastEdemaReport >= REPORT_EDEMA_INTERVAL) {
+        _reportEdemaData(bioCalSuccess, z20k, z50k);
+        _lastEdemaReport = currentTime;
+        _totalReports++;
+    }
+
+    // ========== 电机状态上报 ==========
+    if (_motorStatusChanged) {
+        _reportMotorStatus(motorState);
+        _motorStatusChanged = false;
+        _totalReports++;
+    }
+
+    // ========== 治疗进度上报 ==========
+    if (currentTime - _lastProgressReport >= REPORT_PROGRESS_INTERVAL) {
+        _reportProgress(isTherapyActive, therapyStartTime, therapyEndTime, therapyDuration);
+        _lastProgressReport = currentTime;
+        _totalReports++;
+    }
+}
+
+// ============================================================
+// 强制上报所有数据
+// ============================================================
+void DataReporter::forceReportAll() {
+    _pressureDataChanged = true;
+    _motorStatusChanged = true;
+    
+    // 重置上报计时器
+    unsigned long now = millis();
+    _lastPressureReport = now;
+    _lastEdemaReport = now;
+    _lastProgressReport = now;
+    _lastMotorReport = now;
+    
+    // 重置变化检测
+    for (int i = 0; i < USE_CHANNELS; i++) {
+        _lastReportedForce[i] = 0;
+    }
+}
+
+// ============================================================
+// 上报所有通道压力数据
+// ============================================================
+void DataReporter::_reportAllPressureData(long* forceValues) {
+    bool anyChanged = false;
+    bool anyForceToZero = false;
+
+    for (byte i = 0; i < USE_CHANNELS; i++) {
+        long currentForce = forceValues[i];
+        long lastForce = _lastReportedForce[i];
+
+        // 检测数值变化（超过阈值）
+        if (abs(currentForce - lastForce) >= FORCE_CHANGE_THRESHOLD) {
+            anyChanged = true;
+        }
+
+        // 检测归零情况：上次非零，本次接近零
+        if (lastForce > FORCE_ZERO_THRESHOLD && currentForce <= FORCE_ZERO_THRESHOLD) {
+            anyForceToZero = true;
+            _forceWasNonZero[i] = false;
+        }
+
+        // 记录是否曾为非零值
+        if (currentForce > FORCE_ZERO_THRESHOLD) {
+            _forceWasNonZero[i] = true;
+        }
+    }
+
+    // 如果没有变化、没有归零、且不是强制上报，跳过
+    if (!anyChanged && !anyForceToZero && !_pressureDataChanged) {
+        return;
+    }
+
+    // 执行上报
+    float maxValue = 100.0f;
+    float threshold = 50.0f;
+    
+    for (byte i = 0; i < USE_CHANNELS; i++) {
+        float currentValue = (float)forceValues[i];
+        byte alertFlag = (currentValue >= threshold) ? 2 : 0;
+
+        _protocol->sendPressureData(i + 1, currentValue, maxValue, threshold, alertFlag);
+        _lastReportedForce[i] = forceValues[i];
+    }
+}
+
+// ============================================================
+// 上报水肿数据
+// ============================================================
+void DataReporter::_reportEdemaData(bool bioCalSuccess, double z20k, double z50k) {
+    if (!bioCalSuccess) return;
+
+    float edemaPercent = 0.0f;
+    float impedance = 0.0f;
+    byte alert = 0;
+
+    if (z20k > 0 && z50k > 0) {
+        edemaPercent = (z50k / z20k) * 100.0f;
+        // 限制范围 0~200%，避免异常值
+        if (edemaPercent > 200) edemaPercent = 200;
+    }
+    impedance = (float)z20k;
+
+    // 根据水肿百分比设置告警
+    if (edemaPercent > 150.0f) {
+        alert = 2;  // 高度水肿
+    } else if (edemaPercent > 120.0f) {
+        alert = 1;  // 轻度水肿
+    }
+
+    _protocol->sendEdemaData(1, impedance, edemaPercent, alert);
+}
+
+// ============================================================
+// 上报治疗进度
+// ============================================================
+void DataReporter::_reportProgress(bool isTherapyActive,
+                                   unsigned long therapyStartTime,
+                                   unsigned long therapyEndTime,
+                                   uint16_t therapyDuration)
+{
+    if (!isTherapyActive) return;
+
+    unsigned long currentTime = millis();
+    unsigned long elapsed = (currentTime - therapyStartTime) / 1000;
+    unsigned long total = (unsigned long)therapyDuration * 60UL;
+    unsigned long remaining = (total > elapsed) ? (total - elapsed) : 0;
+
+    // 计算进度百分比
+    byte percent = (total > 0) ? (byte)((elapsed * 100) / total) : 0;
+    if (percent > 100) percent = 100;
+
+    _protocol->sendProgressData(percent, (uint16_t)elapsed, (uint16_t)remaining);
+}
+
+// ============================================================
+// 上报电机状态
+// ============================================================
+void DataReporter::_reportMotorStatus(bool motorState) {
+    byte stepper1State = motorState ? 1 : 0;
+    byte stepper2State = motorState ? 1 : 0;
+    uint16_t speed = motorState ? 100 : 0;
+
+    // 获取舵机真实角度
+    float angles[6];
+    _servo->getCurrentAngles(angles);
+
+    // 转换为字节（0-255 对应 0-270°）
+    byte servoAngles[6];
+    for (int i = 0; i < 6; i++) {
+        servoAngles[i] = (byte)(angles[i] * 255.0f / 270.0f);
+    }
+
+    _protocol->sendMotorStatus(stepper1State, stepper2State, speed, speed, servoAngles, 6);
+}
+
+--------------------------------------------------------------------------------
+
+===== DataReporter.h =====
+/*
+ * ================================================================
+ * DataReporter.h — 数据上报模块
+ * ================================================================
+ * 负责将所有传感器数据通过 BM53 协议上报到上位机
+ * 包括：压力数据、水肿数据、电机状态、治疗进度
+ */
+
+#ifndef DATA_REPORTER_H
+#define DATA_REPORTER_H
+
+#include <Arduino.h>
+#include "BM53_Protocol.h"
+#include "ServoController.h"
+#include "config.h"
+
+// ============================================================
+// 上报间隔配置（毫秒）
+// ============================================================
+#define REPORT_PRESSURE_INTERVAL  200     // 压力数据上报间隔 (5Hz)
+#define REPORT_EDEMA_INTERVAL     1000    // 水肿数据上报间隔 (1Hz)
+#define REPORT_PROGRESS_INTERVAL  1000    // 治疗进度上报间隔 (1Hz)
+#define REPORT_MOTOR_INTERVAL     100     // 电机状态上报间隔 (10Hz)
+
+// ============================================================
+// 压力变化检测阈值
+// ============================================================
+#define FORCE_CHANGE_THRESHOLD    2       // 压力变化阈值 (g)
+#define FORCE_ZERO_THRESHOLD      2       // 归零检测阈值 (g)
+
+// ============================================================
+// 数据上报类
+// ============================================================
+class DataReporter {
+public:
+    /**
+     * @brief 构造函数
+     * @param protocol BM53协议对象指针
+     * @param servo 舵机控制器指针
+     */
+    DataReporter(BM53_Protocol* protocol, ServoController* servo);
+
+    /**
+     * @brief 初始化上报模块
+     */
+    void begin();
+
+    /**
+     * @brief 主循环调用，根据间隔自动上报各类数据
+     * @param forceValues 压力值数组
+     * @param isTherapyActive 治疗是否激活
+     * @param motorState 电机状态
+     * @param therapyStartTime 治疗开始时间
+     * @param therapyEndTime 治疗结束时间
+     * @param therapyDuration 治疗总时长（分钟）
+     * @param bioCalSuccess 生物阻抗校准是否成功
+     * @param z20k 20kHz阻抗值
+     * @param z50k 50kHz阻抗值
+     */
+    void update(long* forceValues, 
+                bool isTherapyActive,
+                bool motorState,
+                unsigned long therapyStartTime,
+                unsigned long therapyEndTime,
+                uint16_t therapyDuration,
+                bool bioCalSuccess,
+                double z20k,
+                double z50k);
+
+    /**
+     * @brief 强制上报所有数据（治疗开始时调用）
+     */
+    void forceReportAll();
+
+    /**
+     * @brief 通知压力数据有变化
+     */
+    void notifyPressureChanged() { _pressureDataChanged = true; }
+
+    /**
+     * @brief 通知电机状态有变化
+     */
+    void notifyMotorChanged() { _motorStatusChanged = true; }
+
+    /**
+     * @brief 获取上报统计信息
+     */
+    unsigned long getTotalReports() const { return _totalReports; }
+
+private:
+    BM53_Protocol* _protocol;       // BM53协议对象
+    ServoController* _servo;        // 舵机控制器
+
+    // 上次上报时间戳
+    unsigned long _lastPressureReport;
+    unsigned long _lastEdemaReport;
+    unsigned long _lastProgressReport;
+    unsigned long _lastMotorReport;
+
+    // 数据变化标志
+    bool _pressureDataChanged;
+    bool _motorStatusChanged;
+
+    // 上次上报的压力值（用于变化检测）
+    long _lastReportedForce[USE_CHANNELS];
+    bool _forceWasNonZero[USE_CHANNELS];
+
+    // 统计
+    unsigned long _totalReports;
+
+    // 内部上报函数
+    void _reportAllPressureData(long* forceValues);
+    void _reportEdemaData(bool bioCalSuccess, double z20k, double z50k);
+    void _reportProgress(bool isTherapyActive, 
+                         unsigned long therapyStartTime,
+                         unsigned long therapyEndTime,
+                         uint16_t therapyDuration);
+    void _reportMotorStatus(bool motorState);
+};
+
+#endif // DATA_REPORTER_H
+
+--------------------------------------------------------------------------------
+
+===== DisplayHelper.cpp =====
+#include "DisplayHelper.h"
+
+// 初始化静态成员变量
+Adafruit_SSD1306* DisplayHelper::display = nullptr;
+
+/**
+ * @brief 初始化显示辅助类
+ * @details 保存OLED对象指针供后续使用
+ */
+void DisplayHelper::init(Adafruit_SSD1306* disp) {
+    display = disp;
+}
+
+/**
+ * @brief 绘制标题栏
+ * @details 显示标题文本并在下方绘制分隔线
+ */
+void DisplayHelper::drawTitleBar(const char* title) {
+    display->setTextSize(1);
+    display->setCursor(0, 0);
+    display->println(title);
+    display->drawLine(0, 9, 127, 9, 1);  // 绘制横线分隔
+}
+
+// ============================================================
+// 校准界面显示函数
+// ============================================================
+
+/**
+ * @brief 显示校准开始界面
+ * @details 显示校准标题、参考电阻值和校准提示
+ */
+void DisplayHelper::showCalibrationStart(int refResistor) {
+    display->clearDisplay();
+    display->setTextColor(1);
+    
+    // 标题
+    drawTitleBar("Dual Freq Cal");
+    
+    // 显示参考电阻值
+    display->setCursor(0, 18);
+    display->print(F("Ref R: "));
+    display->print(refResistor);
+    display->println(F(" Ohm"));
+    
+    // 校准提示
+    display->setCursor(0, 35);
+    display->println(F("Calibrating..."));
+    
+    display->display();
+}
+
+/**
+ * @brief 更新校准进度
+ * @details 在屏幕底部显示当前正在校准的频率
+ */
+void DisplayHelper::updateCalibrationProgress(const char* freqText) {
+    // 清除底部区域（不清除整个屏幕）
+    display->fillRect(0, 50, 128, 14, 0);  // 黑色矩形覆盖
+    
+    // 显示当前频率
+    display->setCursor(0, 50);
+    display->print(freqText);
+    
+    display->display();
+}
+
+/**
+ * @brief 显示校准失败界面
+ * @details 清屏并显示失败信息
+ */
+void DisplayHelper::showCalibrationFailed(const char* freqText) {
+    display->clearDisplay();
+    display->setTextSize(1);
+    display->setCursor(0, 20);
+    
+    // 显示失败的频率
+    display->print(freqText);
+    display->println(F(" Cal FAIL!"));
+    
+    // 提示检查硬件
+    display->setCursor(0, 35);
+    display->println(F("Check HW & Ref R"));
+    
+    display->display();
+}
+
+/**
+ * @brief 显示校准成功界面
+ * @details 显示成功提示和即将开始测量的信息
+ */
+void DisplayHelper::showCalibrationSuccess() {
+    display->clearDisplay();
+    display->setTextSize(1);
+    
+    // 标题
+    drawTitleBar("Cal Success!");
+    
+    // 成功信息
+    display->setCursor(0, 18);
+    display->println(F("20k+50k Ready"));
+    
+    // 提示即将开始测量
+    display->setCursor(0, 50);
+    display->println(F("Start Measure..."));
+    
+    display->display();
+}
+
+// ============================================================
+// 测量结果显示函数
+// ============================================================
+
+/**
+ * @brief 显示双频测量结果
+ * @details 显示20kHz和50kHz的阻抗值，以及阻抗比值（重点放大显示）
+ */
+void DisplayHelper::showMeasurementResult(double z20k, double z50k, double ratio) {
+    display->clearDisplay();
+    
+    // 标题
+    display->setTextSize(1);
+    drawTitleBar("Dual Freq Z Meter");
+    
+    // 显示两个频点的阻抗（左右排列）
+    display->setCursor(0, 18);
+    display->print(F("20k:"));
+    display->print(z20k, 1);  // 保留1位小数
+    
+    display->setCursor(64, 18);
+    display->print(F("50k:"));
+    display->print(z50k, 1);  // 保留1位小数
+    
+    // 放大显示阻抗比值（重点数据）
+    display->setTextSize(2);
+    display->setCursor(0, 35);
+    display->print(F("R:"));
+    display->print(ratio, 3);  // 保留3位小数
+    
+    display->display();
+}
+
+/**
+ * @brief 显示测量错误界面
+ * @details 清屏并显示错误提示
+ */
+void DisplayHelper::showMeasurementError() {
+    display->clearDisplay();
+    display->setTextSize(1);
+    display->setCursor(0, 20);
+    
+    display->println(F("Measure Error!"));
+    
+    // 提示检查硬件
+    display->setCursor(0, 35);
+    display->println(F("Recheck HW"));
+    
+    display->display();
+}
+
+--------------------------------------------------------------------------------
+
+===== DisplayHelper.h =====
+#ifndef DISPLAY_HELPER_H
+#define DISPLAY_HELPER_H
+
+#include <Adafruit_SSD1306.h>
+
+// ============================================================
+// OLED硬件I2C配置（BMduino UNO多路硬件I2C选择）
+// ============================================================
+// OLED使用的I2C接口选择
+#define OLED_I2C_BUS Wire1             // 使用I2C0 (D20/D21)
+// #define OLED_I2C_BUS Wire1         // 使用I2C1 (D18/D19) - 需要时取消此行注释并注释上一行
+
+// OLED硬件I2C引脚定义（仅用于文档说明，实际由Wire库控制）
+#define OLED_SDA_PIN 20               // SDA0 = D20 (PD1)
+#define OLED_SCL_PIN 21               // SCL0 = D21 (PD0)
+// 如使用Wire1，则为：
+// #define OLED_SDA_PIN 18            // SDA1 = D18 (PC1)
+// #define OLED_SCL_PIN 19            // SCL1 = D19 (PC0)
+
+// ============================================================
+// 系统参数配置
+// ============================================================
+#define REF_RESIST 470          // 校准参考电阻值（欧姆）
+//#define CAL_SAMPLES 10          // 校准时的采样次数（取平均）
+//#define MEAS_SAMPLES 10         // 测量时的采样次数（滤波用）
+#define CAL_SAMPLES 10   // 临时改为 1 次（原来是10次）
+#define MEAS_SAMPLES 10  // 临时改为 1 次
+#define FREQ_20KHZ 20000        // 测量频率1: 20kHz
+#define FREQ_50KHZ 50000        // 测量频率2: 50kHz
+
+// ============================================================
+// 硬件配置
+// ============================================================
+#define SCREEN_WIDTH 128        // OLED显示屏宽度（像素）
+#define SCREEN_HEIGHT 64        // OLED显示屏高度（像素）
+#define OLED_ADDR 0x3C          // OLED的I2C地址
+
+// ============================================================
+// OLED显示辅助类
+// 封装所有OLED显示相关函数
+// ============================================================
+class DisplayHelper {
+public:
+    /**
+     * @brief 初始化显示辅助类
+     * @param disp OLED显示对象指针
+     */
+    static void init(Adafruit_SSD1306* disp);
+    
+    // ========== 校准界面显示函数 ==========
+    
+    /**
+     * @brief 显示校准开始界面
+     * @param refResistor 参考电阻值（Ω）
+     */
+    static void showCalibrationStart(int refResistor);
+    
+    /**
+     * @brief 更新校准进度（显示当前校准的频率）
+     * @param freqText 频率文本（如 "20kHz..."）
+     */
+    static void updateCalibrationProgress(const char* freqText);
+    
+    /**
+     * @brief 显示校准失败界面
+     * @param freqText 失败的频率文本（如 "20kHz"）
+     */
+    static void showCalibrationFailed(const char* freqText);
+    
+    /**
+     * @brief 显示校准成功界面
+     */
+    static void showCalibrationSuccess();
+    
+    // ========== 测量结果显示函数 ==========
+    
+    /**
+     * @brief 显示双频测量结果
+     * @param z20k 20kHz阻抗值（Ω）
+     * @param z50k 50kHz阻抗值（Ω）
+     * @param ratio 阻抗比值
+     */
+    static void showMeasurementResult(double z20k, double z50k, double ratio);
+    
+    /**
+     * @brief 显示测量错误界面
+     */
+    static void showMeasurementError();
+    
+private:
+    static Adafruit_SSD1306* display;  // OLED显示对象指针
+    
+    /**
+     * @brief 绘制标题栏（包含标题和分隔线）
+     * @param title 标题文本
+     */
+    static void drawTitleBar(const char* title);
+};
+
+#endif
+
+--------------------------------------------------------------------------------
+
+===== main.ino =====
+/*
+ * 集成系统 - 使用治疗状态机的优化版本
+ */
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "ServoController.h"
+#include "motor_control.h"
+#include "MY2901.h"
+#include "PressureSensor.h"
+#include "AD5933.h"
+#include "DisplayHelper.h"
+#include "config.h"
+#include "BM53_Protocol.h"
+#include "DataReporter.h"
+#include "TherapyStateMachine.h"  // 新增
+#include "TimeStamp.h"            // ★ 时间戳模块
+
+// ==================== 硬件对象创建 ====================
+ServoController servo;
+#define mySerial Serial4
+MY2901 my2901(&mySerial);
+PressureSensor pressureSensor;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire1, -1);
+CalData cal20k, cal50k;
+
+// 通信协议对象
+BM53_Protocol bm53(Serial2);
+
+// ★ 治疗状态机对象
+TherapyStateMachine therapySM;
+
+// ★ 数据上报对象
+DataReporter reporter(&bm53, &servo);
+
+// ==================== 治疗配置 ====================
+TherapyConfig therapyConfig;
+
+// ==================== 定时器变量 ====================
+unsigned long systemStartTime = 0;
+unsigned long lastSampleTime = 0;
+unsigned long cycleStartTime = 0;
+
+const unsigned long SAMPLE_INTERVAL = 200;
+const unsigned long MOTOR_INTERVAL = 35000;
+//
+
+// ==================== 数据存储 ====================
+uint16_t adValues[USE_CHANNELS];
+long forceValues[USE_CHANNELS];
+double Z20k, Phase20k;
+double Z50k, Phase50k;
+double bioRatio;
+
+// ==================== 系统状态 ====================
+bool motorState = false;
+bool bioCalSuccess = false;
+bool firstCycle = true;
+
+// 连接状态监控
+bool wasConnected = true;
+unsigned long disconnectTime = 0;
+const unsigned long DISCONNECT_TIMEOUT = 10000;
+
+// ==================== 电机状态追踪 ====================
+enum MotorPhase {
+    MOTOR_IDLE,         // 空闲
+    MOTOR_MOVING_TO_ARM, // 正在伸出
+    MOTOR_MOVING_BACK   // 正在收回（到位后立即切换到下一个To_arm）
+};
+
+MotorPhase motorPhase = MOTOR_IDLE;
+unsigned long lastMotorPositionCheck = 0;
+const unsigned long MOTOR_POSITION_CHECK_INTERVAL = 100; // 100ms检查一次位置
+
+// 目标位置定义（需要根据实际测量调整）
+const long POSITION_BACK = 0;       // 收回位置（零点）
+const long POSITION_ARM = 1616;     // 伸出位置（对应0x0650脉冲）
+const long POSITION_TOLERANCE = 50; // 位置容差（脉冲数）
+
+unsigned long pauseStartTimeForMotor = 0;   // 电机暂停开始时间
+unsigned long totalPauseTimeForMotor = 0;   // 电机累计暂停时间
+
+// 辅助函数：状态转字符串
+const char* stateToString(TherapyState state) {
+    switch (state) {
+        case STATE_IDLE:            return "IDLE";
+        case STATE_RUNNING:         return "RUNNING";
+        case STATE_PAUSED:          return "PAUSED";
+        case STATE_EMERGENCY_STOP:  return "EMERGENCY_STOP";
+        case STATE_COMPLETED:       return "COMPLETED";
+        default:                    return "UNKNOWN";
+    }
+}
+
+/**
+ * @brief  检查电机是否到达目标位置（使用缓存位置，非阻塞）
+ * @param  targetPosition 目标位置
+ * @return true:两个电机都到达目标位置
+ */
+bool isMotorAtPosition(long targetPosition) {
+    // ★ 2号电机数据暂不可用，使用4号电机代替（两电机物理同步）
+    long pos4 = motor_get_cached_position(0x04);
+    
+    // 检查4号电机位置是否有效
+    if (pos4 < 0) {
+        return false;  // 位置无效，可能还没读取到
+    }
+    
+    // 检查4号电机是否在容差范围内
+    return abs(pos4 - targetPosition) <= POSITION_TOLERANCE;
+}
+
+// ==================== 周期状态保存/恢复 ====================
+struct CycleState {
+    bool isToArmPhase;      // 当前是To_arm阶段还是back阶段
+    bool motorMoving;       // 电机是否正在运动
+    unsigned long cycleElapsedBeforePause; // 暂停前周期已用时间
+};
+CycleState savedCycleState;
+bool hasSavedCycleState = false;
+
+// ==================== 状态变化回调 ====================
+void onTherapyStateChange(TherapyState oldState, TherapyState newState) {
+    Serial.print(F("[状态机] "));
+    Serial.print(stateToString(oldState));  // 旧状态
+    Serial.print(F(" → "));
+    Serial.print(stateToString(newState));  // 新状态
+    Serial.println();
+    
+    switch (newState) {
+        case STATE_RUNNING:
+            Serial.println(F("RUNNING"));
+            // 重置上报模块
+            // 如果是从暂停恢复，不重置周期状态
+            if (oldState == STATE_PAUSED) {
+                // 暂停恢复：已在loop中处理断点续传
+                Serial.println(F("[状态机] 从暂停恢复，从断点继续"));
+                // 不重置 firstCycle 和 cycleStartTime
+            }
+            if (oldState == STATE_IDLE) {
+                // 新治疗开始，重置所有计时
+                firstCycle = true;
+                motorPhase = MOTOR_IDLE;  // ★ 重置电机阶段
+                hasSavedCycleState = false;  // ★ 清除保存的状态
+                cycleStartTime = millis();
+                lastSampleTime = millis();
+                totalPauseTimeForMotor = 0;
+                pauseStartTimeForMotor = 0;
+                // ★ 重置断连追踪，防止之前的断连状态误触发自动停止
+                disconnectTime = millis();
+                wasConnected = true;
+            }
+            if (oldState == STATE_EMERGENCY_STOP) {
+                // 从急停恢复，重新开始
+                firstCycle = true;
+                motorPhase = MOTOR_IDLE;
+                hasSavedCycleState = false;
+                cycleStartTime = millis();
+                lastSampleTime = millis();
+                totalPauseTimeForMotor = 0;
+                pauseStartTimeForMotor = 0;
+            }
+            reporter.forceReportAll();
+            break;
+            
+        case STATE_PAUSED:
+           // 暂停时记录时间
+            if (pauseStartTimeForMotor == 0) {
+                pauseStartTimeForMotor = millis();
+            }
+            Serial.println(F("PAUSED"));
+            motor_stop_all();
+            servo.setAllServos(275);
+            break;
+            
+        case STATE_IDLE:
+            Serial.println(F("IDLE"));
+            motor_stop_all();
+            servo.setAllServos(275);
+            break;
+            
+        case STATE_EMERGENCY_STOP:
+            Serial.println(F("EMERGENCY_STOP"));
+            motor_stop_all();
+            servo.setAllServos(275);
+            break;
+            
+        case STATE_COMPLETED:
+            Serial.println(F("COMPLETED"));
+            motor_stop_all();
+            servo.setAllServos(275);
+            break;
+    }
+}
+
+// ==================== 命令回调函数 ====================
+void onBm53Command(byte cmd, byte* data, uint16_t dataLen) {
+    switch (cmd) {
+        case BM53_CMD_HANDSHAKE:
+            bm53.sendAck();
+            Serial.println(F("[BM53] 握手响应"));
+            break;
+            
+        case BM53_CMD_DEV_INFO:
+            bm53.sendDeviceInfo("RehabDevice01", "v1.0.0");
+            Serial.println(F("[BM53] 设备信息响应"));
+            break;
+            
+        // ========== 开始治疗 ==========
+        case BM53_CMD_START_THERAPY: {
+            if (!therapySM.start(therapyConfig)) {
+                bm53.sendResponse(BM53_CMD_START_THERAPY, 1, 0x01);
+                Serial.println(F("[BM53] 开始治疗被拒绝: 急停状态"));
+            } else {
+                bm53.sendResponse(BM53_CMD_START_THERAPY, 0, 0);
+                Serial.print(F("[BM53] 治疗开始 - 时长:"));
+                Serial.print(therapyConfig.duration);
+                Serial.println(F("分钟"));
+            }
+            break;
+        }
+        
+        // ========== 暂停治疗 ==========
+        case BM53_CMD_PAUSE_THERAPY: {
+            if (therapySM.pause()) {
+                bm53.sendResponse(BM53_CMD_PAUSE_THERAPY, 0, 0);
+                Serial.println(F("[BM53] 治疗暂停"));
+            } else {
+                bm53.sendResponse(BM53_CMD_PAUSE_THERAPY, 1, 0x02);
+                Serial.println(F("[BM53] 暂停被拒绝: 非运行状态"));
+            }
+            break;
+        }
+        
+        // ========== 继续治疗 ==========
+        case BM53_CMD_RESUME_THERAPY: {
+            if (therapySM.resume()) {
+                bm53.sendResponse(BM53_CMD_RESUME_THERAPY, 0, 0);
+                Serial.println(F("[BM53] 治疗继续"));
+            } else {
+                bm53.sendResponse(BM53_CMD_RESUME_THERAPY, 1, 0x03);
+                Serial.println(F("[BM53] 继续被拒绝: 非暂停状态"));
+            }
+            break;
+        }
+            
+        // ========== 停止治疗 ==========
+        case BM53_CMD_STOP_THERAPY: {
+            therapySM.stop();
+            bm53.sendResponse(BM53_CMD_STOP_THERAPY, 0, 0);
+            Serial.println(F("[BM53] 治疗停止"));
+            break;
+        }
+            
+        // ========== 紧急停止 ==========
+        case BM53_CMD_EME_STOP: {
+            therapySM.emergencyStop();
+            bm53.sendAck();
+            Serial.println(F("[BM53] !!! 紧急停止 !!!"));
+            break;
+        }
+        
+        // ========== 退出急停状态 ==========
+        case BM53_CMD_EXIT_EME_STOP: {
+            if (therapySM.exitEmergencyStop()) {
+                bm53.sendResponse(BM53_CMD_EXIT_EME_STOP, 0, 0);
+                Serial.println(F("[BM53] 退出急停状态"));
+            } else {
+                bm53.sendResponse(BM53_CMD_EXIT_EME_STOP, 1, 0x04);
+                Serial.println(F("[BM53] 退出急停被拒绝: 非急停状态"));
+            }
+            break;
+        }
+            
+        // ========== 设置模式 ==========
+        case BM53_CMD_SET_MODE:
+            if (dataLen >= 1) {
+                therapySM.setMode(data[0]);
+                Serial.print(F("[BM53] 设置模式: "));
+                Serial.println(data[0]);
+                bm53.sendResponse(BM53_CMD_SET_MODE, 0, 0);
+            } else {
+                bm53.sendNak();
+            }
+            break;
+            
+        // ========== 设置强度 ==========
+        case BM53_CMD_SET_INTENSITY:
+            if (dataLen >= 1) {
+                therapySM.setIntensity(data[0]);
+                Serial.print(F("[BM53] 设置强度: "));
+                Serial.print(data[0]);
+                Serial.println(F("%"));
+                bm53.sendResponse(BM53_CMD_SET_INTENSITY, 0, 0);
+            } else {
+                bm53.sendNak();
+            }
+            break;
+            
+        // ========== 设置时长 ==========
+        case BM53_CMD_SET_DURATION:
+            if (dataLen >= 1) {
+                therapySM.setDuration(data[0]);
+                Serial.print(F("[BM53] 设置时长: "));
+                Serial.print(data[0]);
+                Serial.println(F("分钟"));
+                bm53.sendResponse(BM53_CMD_SET_DURATION, 0, 0);
+            } else {
+                bm53.sendNak();
+            }
+            break;
+        
+        // ========== 电机回零 ==========
+        case BM53_CMD_MOTOR_HOME: {
+            Serial.println(F("[BM53] 执行电机回零..."));
+            motor_homing();
+            bm53.sendResponse(BM53_CMD_MOTOR_HOME, 0, 0);
+            Serial.println(F("[BM53] 电机回零完成"));
+            break;
+        }
+        
+                // ==========  电机步进（双电机同步） ==========
+        case BM53_CMD_MOTOR_STEP: {
+            // 数据格式: [方向(1)] [步数(4)] [速度(2)]
+            // 方向: 0x00=伸出(CW), 0x01=收回(CCW)
+            if (dataLen >= 7) {
+                byte direction = data[0];
+                unsigned long steps = ((unsigned long)data[1] << 24) | 
+                                    ((unsigned long)data[2] << 16) | 
+                                    ((unsigned long)data[3] << 8) | 
+                                    (unsigned long)data[4];
+                word speed = (data[5] << 8) | data[6];
+                
+                // 使用双电机同步步进
+                motor_step_sync(direction, steps, speed);
+                bm53.sendResponse(BM53_CMD_MOTOR_STEP, 0, 0);
+                
+                Serial.print(F("[BM53] 双电机同步步进 方向="));
+                Serial.print(direction == 0x00 ? F("伸出") : F("收回"));
+                Serial.print(F(" 步数="));
+                Serial.print(steps);
+                Serial.print(F(" 速度="));
+                Serial.println(speed);
+            } else {
+                bm53.sendNak();
+            }
+            break;
+        }
+        
+        // ========== 读取电机位置 ==========
+        case BM53_CMD_MOTOR_POSITION: {
+            // 数据格式: [电机ID(1)]
+            byte motorId = (dataLen >= 1) ? data[0] : 0x02;
+            
+            // ★ 2号电机数据暂不可用，所有请求都使用4号电机
+            byte actualMotorId = (motorId == 0x02) ? 0x04 : motorId;
+            
+            // 使用缓存位置，不阻塞
+            long position = motor_get_cached_position(actualMotorId);
+            if (position < 0) {
+                // 缓存无效，降级为同步读取
+                position = motor_read_position(actualMotorId);
+            }
+            
+            // 返回位置数据
+            byte posData[4];
+            posData[0] = (byte)(position >> 24);
+            posData[1] = (byte)(position >> 16);
+            posData[2] = (byte)(position >> 8);
+            posData[3] = (byte)(position);
+            
+            bm53.sendFrame(BM53_CMD_MOTOR_POSITION, posData, 4);
+            
+            Serial.print(F("[BM53] 电机位置 ID="));
+            Serial.print(motorId, HEX);
+            if (motorId == 0x02) {
+                Serial.print(F("(实际查4号)"));
+            }
+            Serial.print(F(" 位置="));
+            Serial.println(position);
+            break;
+        }
+            
+        case BM53_CMD_STEPPER_CTRL:
+            bm53.sendAck();
+            break;
+            
+        case BM53_CMD_SERVO_CTRL:
+        case BM53_CMD_SERVO_HOME:
+            bm53.sendAck();
+            break;
+            
+        // ========== ★ 设置系统时间（上位机发NTP时间） ==========
+        case BM53_CMD_SET_TIME: {
+            // 数据格式: [unixTimeMs(8)] 小端序
+            if (dataLen >= 8) {
+                unsigned long long unixTimeMs = 0;
+                for (uint8_t i = 0; i < 8; i++) {
+                    unixTimeMs |= ((unsigned long long)data[i] << (i * 8));
+                }
+                systemTime.syncTime(unixTimeMs);
+                bm53.sendResponse(BM53_CMD_SET_TIME, 0, 0);
+            } else {
+                bm53.sendNak();
+            }
+            break;
+        }
+        
+        default:
+            Serial.print(F("[BM53] 未知命令: 0x"));
+            Serial.println(cmd, HEX);
+            bm53.sendNak();
+            break;
+    }
+}
+
+// ==================== Setup ====================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println(F("========== 系统初始化 =========="));
+    
+    // ---------- 1. 初始化 I2C 总线 ----------
+    Wire1.begin();
+    Wire1.setClock(100000);
+    Wire.begin();
+    delay(100);
+    
+    // ---------- 2. 初始化步进电机 ----------
+    motor_init();
+    Serial.println(F("[OK] 步进电机"));
+        
+    // ---------- 3. 初始化舵机 ----------
+    servo.begin();
+    servo.setChannels(servoChannels, servoCount);
+    servo.setAllServos(275);
+    Serial.println(F("[OK] 舵机"));
+    
+    // ---------- 4. 初始化压力传感器 ----------
+    mySerial.begin(MY2901_BAUD_RATE);
+    my2901.begin();
+    pressureSensor.begin();
+    Serial.println(F("[OK] 压力传感器"));
+    
+    // ---------- 5. 初始化 OLED ----------
+    if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+        Serial.println(F("[ERROR] OLED 初始化失败!"));
+    }
+    DisplayHelper::init(&display);
+    Serial.println(F("[OK] OLED"));
+    
+    // ---------- 6. 初始化 AD5933 ----------
+    if (!AD5933::initialize()) {
+        Serial.println(F("[ERROR] AD5933 初始化失败"));
+    }
+    Serial.println(F("[OK] AD5933"));
+    delay(200);
+    
+    // ---------- 7. 初始化通信协议 ----------
+    bm53.setDebug(true);
+    bm53.setDebugStream(&Serial);
+    bm53.begin(460800);
+    bm53.onCommand(onBm53Command);
+    Serial.println(F("[OK] BM53 通信协议"));
+    
+    // ---------- 8. ★ 初始化治疗状态机 ----------
+    therapySM.begin();
+    therapySM.onStateChange(onTherapyStateChange);
+    therapySM.setDisconnectTimeout(DISCONNECT_TIMEOUT);
+    Serial.println(F("[OK] 治疗状态机"));
+    
+    // ---------- 9. ★ 初始化数据上报模块 ----------
+    reporter.begin();
+    Serial.println(F("[OK] 数据上报模块"));
+    
+    // ---------- 9.5. ★ 初始化时间戳模块 ----------
+    systemTime.begin();
+    Serial.println(F("[OK] 时间戳模块"));
+
+    // ---------- 10. 电机回零 ----------
+    Serial.println(F("[INFO] 开始电机回零..."));
+    motor_homing();
+    delay(10);
+    Serial.println(F("[OK] 电机回零完成"));
+    /*
+    // ★ 加大到位窗口到 2° (原来是0.1°，太小了)
+    {
+        // 根据说明书 6.3.5 "修改驱动配置参数" 命令 0x48 0xD1
+        // 最后两个字节 0x00 0x14 = 20，即 2.0°（单位0.1°）
+        byte windowCmd[] = {
+            0x00,                   // 广播地址
+            0x48, 0xD1,             // 修改驱动配置参数
+            0x01,                   // 保存到芯片
+            // 下面21个字节是完整的驱动配置参数，只改最后两字节（到位窗口）
+            0x19,                   // 电机类型 (1.8°)
+            0x02,                   // 脉冲端口模式 (PUL_FOC)
+            0x02,                   // 通讯端口复用 (UART_FUN)
+            0x02,                   // En引脚有效电平 (Hold)
+            0x00,                   // Dir有效方向 (CW)
+            0x10,                   // 细分 (16)
+            0x01,                   // 细分插补 (Enable)
+            0x00,                   // 自动熄屏 (Disable)
+            0x03, 0xE8,             // 开环工作电流 (1000mA)
+            0x0B, 0xB8,             // 闭环堵转最大电流 (3000mA)
+            0x0F, 0xA0,             // 闭环最大输出电压 (4000mV)
+            0x05,                   // 串口波特率 (115200)
+            0x07,                   // CAN通讯速率 (500000)
+            0x01,                   // ID地址 (不变)
+            0x00,                   // 通讯校验方式 (0x6B)
+            0x01,                   // 控制命令应答 (Receive)
+            0x01,                   // 堵转保护 (Enable)
+            0x00, 0x28,             // 堵转保护转速阈值 (40RPM)
+            0x09, 0x60,             // 堵转保护电流阈值 (2400mA)
+            0x0F, 0xA0,             // 堵转保护检测时间 (4000ms)
+            0x00, 0x14,             // ★ 到位窗口 = 20 (即2.0°)
+            0x6B                    // 校验
+        };
+        MOTOR_SERIAL.write(windowCmd, sizeof(windowCmd));
+        delay(100);
+        Serial.println(F("[OK] 到位窗口已设为 2.0°"));
+        
+    }
+    */
+    // ---------- 11. 校准生物电阻抗 ----------
+#if USE_CAL_MACROS
+    cal20k.gain = CAL_GAIN_20KHZ;
+    cal20k.phase = CAL_PHASE_20KHZ;
+    cal50k.gain = CAL_GAIN_50KHZ;
+    cal50k.phase = CAL_PHASE_50KHZ;
+    bioCalSuccess = true;
+    Serial.println(F("========== 使用宏定义校准系数 =========="));
+    DisplayHelper::showCalibrationSuccess();
+    delay(1500);
+#else
+    Serial.println(F("========== 校准中... =========="));
+    DisplayHelper::showCalibrationStart(REF_RESIST);
+    
+    DisplayHelper::updateCalibrationProgress("20kHz...");
+    if (!AD5933::calibrateFrequency(FREQ_20KHZ, REF_RESIST, CAL_SAMPLES, cal20k)) {
+        DisplayHelper::showCalibrationFailed("20kHz");
+        Serial.println(F("[ERROR] 20kHz 校准失败"));
+        for (;;);
+    }
+    
+    DisplayHelper::updateCalibrationProgress("50kHz...");
+    if (!AD5933::calibrateFrequency(FREQ_50KHZ, REF_RESIST, CAL_SAMPLES, cal50k)) {
+        DisplayHelper::showCalibrationFailed("50kHz");
+        Serial.println(F("[ERROR] 50kHz 校准失败"));
+        for (;;);
+    }
+    
+    bioCalSuccess = true;
+    DisplayHelper::showCalibrationSuccess();
+    Serial.println(F("[OK] 校准完成"));
+    delay(1500);
+#endif
+    
+    // ---------- 12. 初始化定时器 ----------
+    systemStartTime = millis();
+    lastSampleTime = systemStartTime;
+    cycleStartTime = systemStartTime;
+    
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 20);
+    display.println(F("System Ready"));
+    display.setCursor(0, 35);
+    display.println(F("Waiting for cmd..."));
+    display.display();
+    
+    Serial.println(F("========== 系统启动 =========="));
+    Serial.println(F("等待上位机指令..."));
+}
+
+// ==================== Loop ====================
+void loop() {
+    unsigned long currentTime = millis();
+    
+    // ========== 最高优先级：通信处理 ==========
+    bm53.loop();
+    
+    // ========== 电机位置异步轮询（每循环调用一次） ==========
+    motor_poll_positions();  // 自动轮流读取两个电机位置
+
+    // ==========  更新治疗状态机 ==========
+    therapySM.update();
+    
+    // ==========  更新连接状态 ==========
+    bool currentlyConnected = bm53.isConnected();
+    
+    if (wasConnected && !currentlyConnected) {
+        disconnectTime = currentTime;
+    }
+    
+    unsigned long disconnectedDuration = currentlyConnected ? 0 : (currentTime - disconnectTime);
+    therapySM.updateConnectionStatus(currentlyConnected, disconnectedDuration);
+    
+    wasConnected = currentlyConnected;
+    
+    // ========== 急停检查 ==========
+    if (therapySM.isEmergencyStopped()) {
+        return;  // 急停状态下只处理通信，不执行任何动作
+    }
+    
+    // ========== 治疗激活检查 ==========
+    if (!therapySM.isTherapyActive()) {
+        // 显示断连信息
+        if (therapySM.isAutoStopDueToDisconnect() && currentlyConnected) {
+            display.clearDisplay();
+            display.setTextSize(1);
+            display.setCursor(0, 20);
+            display.println(F("Reconnected"));
+            display.setCursor(0, 35);
+            display.println(F("Send START to"));
+            display.setCursor(0, 50);
+            display.println(F("resume therapy"));
+            display.display();
+        }
+        return;
+    }
+    
+    unsigned long adjustedCurrentTime = currentTime - totalPauseTimeForMotor;
+
+
+    // ========== 暂停状态处理 ==========
+    if (therapySM.isPaused()) {
+        // 暂停时保存状态
+        if (!hasSavedCycleState) {
+            savedCycleState.isToArmPhase = motorState;
+            savedCycleState.motorMoving = (motorPhase == MOTOR_MOVING_TO_ARM || motorPhase == MOTOR_MOVING_BACK);
+            savedCycleState.cycleElapsedBeforePause = (adjustedCurrentTime - cycleStartTime);
+            hasSavedCycleState = true;
+            Serial.println(F("[暂停] 周期状态已保存"));
+            Serial.print(F("  isToArmPhase=")); Serial.println(savedCycleState.isToArmPhase);
+            Serial.print(F("  motorMoving=")); Serial.println(savedCycleState.motorMoving);
+            Serial.print(F("  cycleElapsed=")); Serial.print(savedCycleState.cycleElapsedBeforePause / 1000); Serial.println(F("秒"));
+        }
+        // 暂停状态下继续上报但不执行动作
+        reporter.update(forceValues, 
+                        therapySM.isTherapyActive(),
+                        motorState,
+                        therapySM.getStartTime(),
+                        therapySM.getEndTime(),
+                        therapySM.getConfig().duration,
+                        bioCalSuccess,
+                        Z20k, Z50k);
+        return;
+    }
+    else {
+        // 恢复时加载状态
+        if (hasSavedCycleState && pauseStartTimeForMotor > 0) {
+            totalPauseTimeForMotor += (currentTime - pauseStartTimeForMotor);
+            pauseStartTimeForMotor = 0;
+            
+            // 重新计算 adjustedCurrentTime
+            adjustedCurrentTime = currentTime - totalPauseTimeForMotor;
+
+            // 恢复保存的周期状态
+            motorState = savedCycleState.isToArmPhase;
+            if (savedCycleState.motorMoving) {
+                // 如果暂停时电机正在运动，需要重新发送命令
+                if (motorState) {
+                    Serial.println(F("[恢复] 重新执行To_arm"));
+                    servo.setAllServos(200);
+                    delay(100);
+                    To_arm();
+                    motor_notify_move_started(); // ★ 新增
+                    motorPhase = MOTOR_MOVING_TO_ARM;
+                } else {
+                    Serial.println(F("[恢复] 重新执行back"));
+                    servo.setAllServos(265);
+                    delay(100);
+                    back();
+                    motor_notify_move_started(); // ★ 新增
+                    motorPhase = MOTOR_MOVING_BACK;
+                }
+                 motor_invalidate_reached();  // ★ 改为清到位状态
+            }
+            else {
+                // 暂停时电机已到位，根据方向恢复到对应的运动阶段
+                // 由于已去掉AT_ARM/AT_BACK，到位后应立即触发下一阶段
+                // 这里让cycleStartTime设为过去，使超时兜底立即生效，或直接启动下一阶段
+                if (motorState) {
+                    // 上次是To_arm阶段且已到位，立即开始back
+                    Serial.println(F("[恢复] 到位状态，立即执行Back"));
+                    servo.setAllServos(265);
+                    delay(100);
+                    back();
+                    motor_notify_move_started();
+                    motorPhase = MOTOR_MOVING_BACK;
+                    motorState = false;
+                } else {
+                    // 上次是back阶段且已到位，立即开始新周期To_arm
+                    Serial.println(F("[恢复] 到位状态，立即执行To_arm"));
+                    servo.setAllServos(200);
+                    delay(100);
+                    To_arm();
+                    motor_notify_move_started();
+                    motorPhase = MOTOR_MOVING_TO_ARM;
+                    motorState = true;
+                }
+                cycleStartTime = adjustedCurrentTime;
+                motor_invalidate_reached();
+            }
+
+            hasSavedCycleState = false;
+            
+            Serial.print(F("[INFO] 治疗恢复，暂停时长: "));
+            Serial.print(totalPauseTimeForMotor / 1000);
+            Serial.println(F(" 秒"));
+            Serial.print(F("[INFO] 从断点继续，当前阶段: "));
+            Serial.print(motorState ? F("To_arm/AT_ARM") : F("Back/AT_BACK"));
+            Serial.print(F(" motorPhase="));
+            Serial.println(motorPhase);
+        }
+
+    }
+    
+    // ========== 治疗时间检查 ==========
+    if (therapySM.isTimeUp() || therapySM.getState() == STATE_COMPLETED) {
+        reporter.update(forceValues,
+                        therapySM.isTherapyActive(),
+                        motorState,
+                        therapySM.getStartTime(),
+                        therapySM.getEndTime(),
+                        therapySM.getConfig().duration,
+                        bioCalSuccess,
+                        Z20k, Z50k);
+        return;
+    }
+    
+
+    // ========== 基于到位状态的电机状态机 ==========
+    // 到位后立即切换到下一阶段，MOTOR_INTERVAL 仅作为超时兜底（到位检测失效时的保护）
+    switch (motorPhase) {
+        case MOTOR_IDLE:
+            if (firstCycle || !motorState) {
+                Serial.println(F("\n========== To_arm 阶段 =========="));
+                servo.setAllServosWithPID(237);
+                delay(100);
+                To_arm();
+                motor_notify_move_started();
+                motorPhase = MOTOR_MOVING_TO_ARM;
+                motorState = true;
+                firstCycle = false;
+                cycleStartTime = adjustedCurrentTime;  // ★ 记录运动开始时间（用于超时兜底）
+                motor_invalidate_reached();
+                reporter.notifyMotorChanged();
+            }
+            break;
+            
+        case MOTOR_MOVING_TO_ARM:
+            // ★ 到位后立即切换到back阶段
+            if (motor_both_reached()) {
+                Serial.println(F("[到位] 已到达伸出位置，立即切换到Back"));
+                motor_invalidate_reached();
+                
+                // 立即开始back
+                Serial.println(F("\n========== Back 阶段 =========="));
+                servo.setAllServos(265);
+                delay(100);
+                back();
+                motor_notify_move_started();
+                motorPhase = MOTOR_MOVING_BACK;
+                motorState = false;
+                cycleStartTime = adjustedCurrentTime;  // ★ 重置超时计时
+                motor_invalidate_reached();
+                reporter.notifyMotorChanged();
+            }
+            // ★ 超时兜底：到位检测失败时，超过MOTOR_INTERVAL强制切换
+            else if (adjustedCurrentTime - cycleStartTime >= MOTOR_INTERVAL) {
+                Serial.println(F("[超时] To_arm到位检测超时，强制切换到Back"));
+                motor_invalidate_reached();
+                
+                Serial.println(F("\n========== Back 阶段(超时触发) =========="));
+                servo.setAllServos(265);
+                delay(100);
+                back();
+                motor_notify_move_started();
+                motorPhase = MOTOR_MOVING_BACK;
+                motorState = false;
+                cycleStartTime = adjustedCurrentTime;
+                motor_invalidate_reached();
+                reporter.notifyMotorChanged();
+            }
+            break;
+            
+        case MOTOR_MOVING_BACK:
+            // ★ 到位后立即切换到新的To_arm阶段
+            if (motor_both_reached()) {
+                Serial.println(F("[到位] 已到达收回位置，立即切换到To_arm"));
+                motor_invalidate_reached();
+                
+                // 立即开始新周期To_arm
+                Serial.println(F("\n========== 新周期 To_arm 阶段 =========="));
+                servo.setAllServos(200);
+                delay(100);
+                To_arm();
+                motor_notify_move_started();
+                motorPhase = MOTOR_MOVING_TO_ARM;
+                motorState = true;
+                cycleStartTime = adjustedCurrentTime;  // ★ 重置超时计时
+                motor_invalidate_reached();
+                reporter.notifyMotorChanged();
+            }
+            // ★ 超时兜底：到位检测失败时，超过MOTOR_INTERVAL强制切换
+            else if (adjustedCurrentTime - cycleStartTime >= MOTOR_INTERVAL) {
+                Serial.println(F("[超时] Back到位检测超时，强制切换到To_arm"));
+                motor_invalidate_reached();
+                
+                Serial.println(F("\n========== 新周期 To_arm 阶段(超时触发) =========="));
+                servo.setAllServos(200);
+                delay(100);
+                To_arm();
+                motor_notify_move_started();
+                motorPhase = MOTOR_MOVING_TO_ARM;
+                motorState = true;
+                cycleStartTime = adjustedCurrentTime;
+                motor_invalidate_reached();
+                reporter.notifyMotorChanged();
+            }
+            break;
+    }
+
+    
+    // ========== 压力采集 + PID控制（仅在To_arm阶段执行） ==========
+    if (motorState) {
+        if (adjustedCurrentTime - lastSampleTime >= SAMPLE_INTERVAL) {
+            lastSampleTime = currentTime;
+            
+            if (my2901.update()) {
+                my2901.getMultiAD(adValues, USE_CHANNELS);
+                pressureSensor.batchConvert(adValues, forceValues, USE_CHANNELS);
+                
+                // ★ PID控制：根据压力反馈动态调整舵机
+                servo.updatePIDControl(forceValues, USE_CHANNELS);
+                
+                for (uint8_t i = 0; i < USE_CHANNELS; i++) {
+                    static long lastForce[USE_CHANNELS] = {0};
+                    if (abs(forceValues[i] - lastForce[i]) >= FORCE_CHANGE_THRESHOLD) {
+                        reporter.notifyPressureChanged();
+                        break;
+                    }
+                    lastForce[i] = forceValues[i];
+                }
+                
+                for (uint8_t i = 0; i < USE_CHANNELS; i++) {
+                    Serial.print(forceValues[i]);
+                    if (i < USE_CHANNELS - 1) Serial.print('\t');
+                }
+                Serial.println();
+            }
+        }
+    } else {
+        if (bioCalSuccess) {
+            bool ok20k = AD5933::measureImpedance(FREQ_20KHZ, cal20k, MEAS_SAMPLES, Z20k, Phase20k);
+            delay(50);
+            bool ok50k = AD5933::measureImpedance(FREQ_50KHZ, cal50k, MEAS_SAMPLES, Z50k, Phase50k);
+            
+            if (ok20k && ok50k) {
+                bioRatio = Z20k / Z50k;
+                DisplayHelper::showMeasurementResult(Z20k, Z50k, bioRatio);
+            }
+        }
+    }
+    
+    // ========== 数据上报 ==========
+    reporter.update(forceValues,
+                    therapySM.isTherapyActive(),
+                    motorState,
+                    therapySM.getStartTime(),
+                    therapySM.getEndTime(),
+                    therapySM.getConfig().duration,
+                    bioCalSuccess,
+                    Z20k, Z50k);
+    
+    // ========== 监控队列状态 ==========
+    static unsigned long lastQueueCheck = 0;
+    if (currentTime - lastQueueCheck >= 5000) {
+        int queueCount = bm53.getQueueCount();
+        if (queueCount > 10) {
+            Serial.print(F("[警告] 发送队列积压: "));
+            Serial.print(queueCount);
+            Serial.println(F(" 个包"));
+        }
+        lastQueueCheck = currentTime;
+    }
+}
+
+--------------------------------------------------------------------------------
+
+===== motor_control.cpp =====
+#include "motor_control.h"
+
+/************************************************
+ * 全局指令数组
+ ************************************************/
+// 电机同步运行指令：地址0 + 0xFF + 0x66 + 校验0x6B
+// 作用：发送该指令后，之前设置好参数的电机同时启动
+byte together_Motor[] = {0x00, 0xFF, 0x66, 0x6B};
+
+/************************************************
+ * ========== 异步位置读取相关变量 ==========
+ ************************************************/
+static bool _asyncRequestPending = false;     // 是否有未完成的异步请求
+static byte _asyncMotorId = 0;                // 正在请求的电机ID
+static unsigned long _asyncRequestTime = 0;   // 请求发送时间
+static long _asyncPositionResult = -1;        // 异步读取结果
+static bool _asyncResultReady = false;        // 结果是否就绪
+
+// 异步请求队列（支持轮询两个电机）
+static byte _asyncMotorQueue[2] = {0x02, 0x04};  // 电机ID队列
+static uint8_t _asyncQueueIndex = 0;              // 当前队列索引
+static long _asyncMotorPositions[2] = {-1, -1};   // 两个电机位置缓存
+static bool _asyncMotorPositionValid[2] = {false, false}; // 位置是否有效
+static unsigned long _asyncLastCompleteTime = 0;  // 上次完成时间
+
+/************************************************
+ * 内部函数声明
+ ************************************************/
+static void sendMotorCmd(byte ID, byte dir, byte v1, byte v2, byte a,
+                         byte d1, byte d2, byte d3, byte d4, byte absolute);
+
+/************************************************
+ * ★ 位置数据缓存（静态全局变量）
+ ************************************************/
+static long _lastPosition = -1;
+static bool _newPositionData = false;
+static unsigned long _positionRequestTime = 0;
+
+
+// ★ 新增：电机运动开始后的屏蔽时间（毫秒）
+#define MOTOR_MOVE_BLIND_MS 200  // 运动开始后200ms内不上报到位
+
+static unsigned long _motorMoveStartTime = 0;  // 运动开始时间
+static bool _motorMoving = false;               // 电机是否在运动中
+
+/************************************************
+ * 函数实现
+ ************************************************/
+
+// ==================== 异步位置读取实现 ====================
+
+/**
+ * @brief  启动异步位置读取（非阻塞）
+ * @param  motorId 电机ID (0x02 或 0x04)
+ * @return true:请求已发送 false:上一个请求未完成
+ */
+bool motor_request_position_async(byte motorId) {
+    if (_asyncRequestPending) {
+        return false;  // 上一个请求还未完成
+    }
+    
+    // 发送读取位置命令：ID + 0x36 + 校验
+    byte cmd[] = {motorId, 0x36, MOTOR_FIXED_CHECKSUM};
+    MOTOR_SERIAL.write(cmd, sizeof(cmd));
+    
+    _asyncRequestPending = true;
+    _asyncMotorId = motorId;
+    _asyncRequestTime = millis();
+    _asyncResultReady = false;
+    _asyncPositionResult = -1;
+    
+    return true;
+}
+
+
+
+/**
+ * @brief  检查异步读取结果（非阻塞，在loop中调用）
+ * @param  position 输出参数，存储读取到的位置
+ * @return true:结果已就绪（成功或超时） false:仍在等待
+ */
+bool motor_get_position_async_result(long* position) {
+    if (!_asyncRequestPending) {
+        return false;
+    }
+    
+    // ========== 超时检查 ==========
+    if (millis() - _asyncRequestTime > 200) {  // 缩短超时到200ms
+        _asyncRequestPending = false;
+        _asyncResultReady = true;
+        _asyncPositionResult = -1;
+        if (position) *position = -1;
+        return true;  // 超时也算完成，返回-1
+    }
+    
+    // ========== ★ 响应帧为8字节：地址 + 0x36 + 符号 + 位置(4字节) + 校验 ==========
+    if (MOTOR_SERIAL.available() < 8) {
+        return false;  // 数据还不够
+    }
+    
+    // ========== 读取响应 ==========
+    byte response[8];
+    int bytesRead = 0;
+    
+    while (MOTOR_SERIAL.available() && bytesRead < 8) {
+        response[bytesRead++] = MOTOR_SERIAL.read();
+    }
+    
+    // ========== 验证响应 ==========
+    if (bytesRead >= 8) {
+        // ★ 检查帧格式：地址 + 0x36 + 符号 + 位置(4) + 校验
+        if (response[0] == _asyncMotorId && 
+            response[1] == 0x36 && 
+            response[7] == MOTOR_FIXED_CHECKSUM) {  // ★ 校验在第7字节（索引7）
+            
+            // ★ 解析位置数据（字节2是符号，字节3-6是位置，大端序）
+            byte sign = response[2];  // 符号：0x00=正，0x01=负
+            long rawPosition = ((long)response[3] << 24) | 
+                               ((long)response[4] << 16) | 
+                               ((long)response[5] << 8) | 
+                               (long)response[6];
+            
+            // 如果有符号位且为负
+            if (sign == 0x01) {
+                _asyncPositionResult = -rawPosition;
+            } else {
+                _asyncPositionResult = rawPosition;
+            }
+        } else {
+            _asyncPositionResult = -1;  // 校验失败
+        }
+    } else {
+        _asyncPositionResult = -1;
+    }
+    
+    // 清理请求状态
+    _asyncRequestPending = false;
+    _asyncResultReady = true;
+    
+    if (position) {
+        *position = _asyncPositionResult;
+    }
+    
+    return true;
+}
+
+/**
+ * @brief  取消正在进行的异步请求
+ */
+void motor_cancel_async_request() {
+    _asyncRequestPending = false;
+    _asyncResultReady = false;
+}
+
+/**
+ * @brief  启动异步状态查询（查询到位标志）
+ */
+bool motor_request_status_async(byte motorId) {
+    if (_asyncRequestPending) {
+        return false;
+    }
+    
+    // 发送读取状态命令：ID + 0x3A + 校验
+    byte cmd[] = {motorId, 0x3A, MOTOR_FIXED_CHECKSUM};
+    MOTOR_SERIAL.write(cmd, sizeof(cmd));
+    
+    _asyncRequestPending = true;
+    _asyncMotorId = motorId;
+    _asyncRequestTime = millis();
+    _asyncResultReady = false;
+    _asyncPositionResult = -1;
+    
+    return true;
+}
+
+/**
+ * @brief  检查状态查询结果
+ * @param  reached 输出：是否到位
+ * @return true:结果就绪 false:等待中
+ */
+bool motor_get_status_async_result(bool* reached) {
+    if (!_asyncRequestPending) {
+        return false;
+    }
+    
+    // 超时检查
+    if (millis() - _asyncRequestTime > 200) {
+        _asyncRequestPending = false;
+        _asyncResultReady = true;
+        if (reached) *reached = false;
+        return true;
+    }
+    
+    if (MOTOR_SERIAL.available() < 4) {
+        return false;
+    }
+    
+    byte response[4];
+    int bytesRead = 0;
+    while (MOTOR_SERIAL.available() && bytesRead < 4) {
+        response[bytesRead++] = MOTOR_SERIAL.read();
+    }
+    
+    bool isReached = false;
+    if (bytesRead >= 4) {
+        if (response[0] == _asyncMotorId && 
+            response[1] == 0x3A && 
+            response[3] == MOTOR_FIXED_CHECKSUM) {
+            
+            byte status = response[2];
+            isReached = (status & 0x02) != 0;
+            
+            // ★ 添加详细日志，每个电机只打印一次
+            static byte lastStatus[2] = {0xFF, 0xFF};
+            uint8_t idx = (_asyncMotorId == 0x02) ? 0 : 1;
+            if (status != lastStatus[idx]) {
+                Serial.print(F("[状态] 电机0x"));
+                Serial.print(_asyncMotorId, HEX);
+                Serial.print(F(" 原始状态=0x"));
+                if (status < 0x10) Serial.print('0');
+                Serial.print(status, HEX);
+                Serial.print(F(" 使能="));
+                Serial.print((status & 0x01) ? "是" : "否");
+                Serial.print(F(" 到位="));
+                Serial.print((status & 0x02) ? "是" : "否");
+                Serial.print(F(" 堵转="));
+                Serial.print((status & 0x04) ? "是" : "否");
+                Serial.print(F(" 堵转保护="));
+                Serial.println((status & 0x08) ? "是" : "否");
+                lastStatus[idx] = status;
+            }
+        }
+    }
+    
+    _asyncRequestPending = false;
+    _asyncResultReady = true;
+    
+    if (reached) {
+        *reached = isReached;
+    }
+    
+    return true;
+}
+
+// ==================== 双电机轮询读取实现 ====================
+// ========== 到位状态缓存 ==========
+static bool _motorReached[2] = {false, false};
+static bool _motorReachedValid[2] = {false, false};
+
+void motor_invalidate_reached() {
+    // ★ 只标记为待验证，不清除到位值
+    _motorReachedValid[0] = false;
+    _motorReachedValid[1] = false;
+    // 不清除 _motorReached[0] 和 _motorReached[1] 的值
+    
+    _motorMoving = false;
+    motor_cancel_async_request();  // ★ 新增：取消正在等待的poll请求，防止读到过时响应
+    motor_clear_rx_buffer();       // 清空串口缓冲区，丢弃残留的旧数据
+    Serial.println(F("[到位] 到位状态标记为待验证"));
+}
+
+
+bool motor_both_reached() {
+    // ★ 运动开始后200ms内不检测到位（电机加速阶段）
+    if (_motorMoving && (millis() - _motorMoveStartTime) < MOTOR_MOVE_BLIND_MS) {
+        return false;
+    }
+    
+    // ★ 如果到位状态无效，返回 false 等待重新验证
+    if (!_motorReachedValid[1]) {
+        return false;
+    }
+    
+    // ★ 添加运动超时保护（例如10秒）
+    if (_motorMoving && (millis() - _motorMoveStartTime) > 10000) {
+        Serial.println(F("[到位] 运动超时，强制认为到位"));
+        return true;
+    }
+    
+    // 检查4号电机到位状态
+    if (_motorReached[1]) {
+        return true;
+    }
+    return false;
+}
+
+// ★ 新增：清空电机串口接收缓冲区
+void motor_clear_rx_buffer() {
+    while (MOTOR_SERIAL.available()) {
+        MOTOR_SERIAL.read();
+    }
+}
+
+// ★ 在发送运动指令后调用
+void motor_notify_move_started() {
+    _motorMoveStartTime = millis();
+    _motorMoving = true;
+    motor_cancel_async_request();  // ★ 新增：取消旧的异步请求，防止残留响应干扰
+    motor_clear_rx_buffer();       // 清空旧数据
+    Serial.println(F("[电机] 运动开始，清空缓冲并屏蔽到位检测200ms"));
+}
+
+// motor_poll_positions 里要查询状态0x3A
+/*void motor_poll_positions() {
+    if (_asyncRequestPending) {
+        bool reached;
+        if (motor_get_status_async_result(&reached)) {
+            uint8_t idx = (_asyncMotorId == 0x02) ? 0 : 1;
+            _motorReached[idx] = reached;
+            _motorReachedValid[idx] = true;
+            
+            Serial.print(F("[轮询] 电机0x"));
+            Serial.print(_asyncMotorId, HEX);
+            Serial.print(F(" 到位="));
+            Serial.println(reached ? "是" : "否");
+            
+            _asyncLastCompleteTime = millis();
+            _asyncQueueIndex = (_asyncQueueIndex + 1) % 2;
+        }
+        return;
+    }
+    
+    if (millis() - _asyncLastCompleteTime >= 50) {
+        byte nextMotor = _asyncMotorQueue[_asyncQueueIndex];
+        motor_request_status_async(nextMotor);
+    }
+}
+*/
+void motor_poll_positions() {
+    if (_asyncRequestPending) {
+        bool reached;
+        if (motor_get_status_async_result(&reached)) {
+            if (_asyncMotorId == 0x04) {
+                // ★ 只在状态变化时打印
+                static bool lastReached = false;
+                if (reached != lastReached || !_motorReachedValid[1]) {
+                    Serial.print(F("[轮询] 电机0x04 到位="));
+                    Serial.println(reached ? "是" : "否");
+                    lastReached = reached;
+                }
+                
+                _motorReached[1] = reached;
+                _motorReachedValid[1] = true;
+            }
+            
+            _asyncLastCompleteTime = millis();
+            // ★ 不要递增队列索引
+        }
+        return;
+    }
+    
+    if (millis() - _asyncLastCompleteTime >= 100) {
+        motor_request_status_async(0x04);
+    }
+}
+
+
+bool motor_is_reached_valid() {
+    return _motorReachedValid[1];  // 返回4号电机（索引1）的到位状态有效性
+}
+
+unsigned long motor_get_move_start_time() {
+    return _motorMoveStartTime;
+}
+
+/**
+ * @brief  获取缓存的到位状态
+ */
+bool motor_get_cached_reached(byte motorId) {
+    // ★ 2号电机数据暂不可用，查询2号时返回4号电机状态
+    uint8_t idx = (motorId == 0x02) ? 1 : 1;  // 全部使用4号电机（索引1）
+    if (_motorReachedValid[idx]) {
+        return _motorReached[idx];
+    }
+    return false;
+}
+
+
+/**
+ * @brief  启动双电机位置轮询（在loop中调用，自动轮流读取两个电机）
+ * @details 每次调用会尝试读取一个电机，读完自动切换下一个
+ *          两个电机的位置会缓存到内部数组
+ */
+// ==================== 修改 motor_poll_positions 函数 ====================
+/*void motor_poll_positions() {
+    // ========== 如果当前有请求在处理中 ==========
+    if (_asyncRequestPending) {
+        long position;
+        if (motor_get_position_async_result(&position)) {
+            uint8_t idx = (_asyncMotorId == 0x02) ? 0 : 1;
+
+            
+            _asyncMotorPositions[idx] = position;
+            _asyncMotorPositionValid[idx] = (position >= 0);
+            
+            Serial.print(F("[轮询] 电机0x"));
+            Serial.print(_asyncMotorId, HEX);
+            Serial.print(F(" 位置="));
+            Serial.print(position);
+            Serial.print(F(" 有效="));
+            Serial.println(_asyncMotorPositionValid[idx] ? "是" : "否");
+            
+            _asyncLastCompleteTime = millis();
+            _asyncQueueIndex = (_asyncQueueIndex + 1) % 2;
+        }
+        return;
+    }
+    
+    // ========== 开始新请求 ==========
+    if (millis() - _asyncLastCompleteTime >= 100) {
+        byte nextMotor = _asyncMotorQueue[_asyncQueueIndex];
+        motor_request_position_async(nextMotor);
+    }
+}*/
+
+/**
+ * @brief  获取缓存的电机位置（从轮询结果中读取）
+ * @param  motorId 电机ID (0x02 或 0x04)
+ * @return 位置值，-1表示无效或未读取
+ */
+long motor_get_cached_position(byte motorId) {
+    // ★ 2号电机数据暂不可用，查询2号时返回4号电机位置
+    uint8_t idx = 1;  // 全部使用4号电机（索引1）
+    if (_asyncMotorPositionValid[idx]) {
+        return _asyncMotorPositions[idx];
+    }
+    return -1;
+}
+
+/**
+ * @brief  检查缓存的位置是否有效
+ * @param  motorId 电机ID (0x02 或 0x04)
+ * @return true:位置有效 false:无效或过期
+ */
+bool motor_is_position_valid(byte motorId) {
+    // ★ 2号电机数据暂不可用，查询2号时返回4号电机有效性
+    uint8_t idx = 1;  // 全部使用4号电机（索引1）
+    return _asyncMotorPositionValid[idx];
+}
+
+/**
+ * @brief  检查两个电机位置是否都有效
+ * @return true:两个位置都有效
+ */
+bool motor_both_positions_valid() {
+    // ★ 2号电机数据暂不可用，只需检查4号电机
+    return _asyncMotorPositionValid[1];
+}
+
+/**
+ * @brief  使缓存位置失效（强制下次重新读取）
+ */
+void motor_invalidate_positions() {
+    _asyncMotorPositionValid[0] = false;
+    _asyncMotorPositionValid[1] = false;
+    _asyncMotorPositions[0] = -1;
+    _asyncMotorPositions[1] = -1;
+}
+
+void motor_init(void)
+{
+    MOTOR_SERIAL.begin(MOTOR_BAUD_RATE);
+    delay(1000);
+}
+
+void To_arm(void)
+{
+    // 速度30RPM(0x011E), 加速度60(0x3C), 脉冲0x000650(1616)
+    sendMotorCmd(0x02, 0x01, 0x01, 0x1E, 0x3C, 0x00, 0x06, 0x50, 0x00, 0x01);
+    sendMotorCmd(0x04, 0x01, 0x01, 0x1E, 0x3C, 0x00, 0x06, 0x50, 0x00, 0x01);
+    MOTOR_SERIAL.write(together_Motor, sizeof(together_Motor));
+}
+
+void back(void)
+{
+    // 速度30RPM(0x011E), 加速度60(0x3C), 脉冲0x000000(回零位)
+    sendMotorCmd(0x02, 0x01, 0x01, 0x1E, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x01);
+    sendMotorCmd(0x04, 0x01, 0x01, 0x1E, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x01);
+    MOTOR_SERIAL.write(together_Motor, sizeof(together_Motor));
+}
+
+void motor_stop_all(void)
+{
+    byte stopCmdAll[] = {0x00, 0xFE, 0x98, 0x00, 0x6B};
+    MOTOR_SERIAL.write(stopCmdAll, sizeof(stopCmdAll));
+}
+
+static void sendMotorCmd(byte ID, byte dir, byte v1, byte v2, byte a,
+                         byte d1, byte d2, byte d3, byte d4, byte absolute)
+{
+    byte cmd[13] = {
+        ID,
+        0xFD,
+        dir,
+        v1,
+        v2,
+        a,
+        d1,
+        d2,
+        d3,
+        d4,
+        absolute,
+        0x01,      // 多机同步运行标志 = 0x01（等待同步指令）
+        MOTOR_FIXED_CHECKSUM
+    };
+    MOTOR_SERIAL.write(cmd, sizeof(cmd));
+    delay(50);
+}
+
+static void splitSpeed(word speed, byte *v1, byte *v2)
+{
+    *v1 = highByte(speed);
+    *v2 = lowByte(speed);
+}
+
+void motor_homing(void)
+{
+    Serial.begin(115200);
+    Serial.println("\n========== 开始回零 ==========");
+    
+    pinMode(LIMIT_SWITCH_2_PIN, INPUT_PULLUP);
+    pinMode(LIMIT_SWITCH_4_PIN, INPUT_PULLUP);
+    delay(100);
+
+    bool switch2_triggered = (digitalRead(LIMIT_SWITCH_2_PIN) == LOW);
+    bool switch4_triggered = (digitalRead(LIMIT_SWITCH_4_PIN) == LOW);
+    Serial.print("D4(2号电机限位)初始电平: "); Serial.println(switch2_triggered ? "LOW(已在零点)" : "HIGH(需要回零)");
+    Serial.print("D5(4号电机限位)初始电平: "); Serial.println(switch4_triggered ? "LOW(已在零点)" : "HIGH(需要回零)");
+
+    if (switch2_triggered) {
+        Serial.println("2号电机: 已在零点，直接清零位置");
+        byte cmd2_zero[] = {0x02, 0x0A, 0x6D, MOTOR_FIXED_CHECKSUM};
+        MOTOR_SERIAL.write(cmd2_zero, sizeof(cmd2_zero));
+        delay(50);
+    }
+
+    if (switch4_triggered) {
+        Serial.println("4号电机: 已在零点，直接清零位置");
+        byte cmd4_zero[] = {0x04, 0x0A, 0x6D, MOTOR_FIXED_CHECKSUM};
+        MOTOR_SERIAL.write(cmd4_zero, sizeof(cmd4_zero));
+        delay(50);
+    }
+
+    if (switch2_triggered && switch4_triggered) {
+        Serial.println("========== 回零完成(全部已在零点) ==========\n");
+        return;
+    }
+
+    word speed = HOMING_SPEED * 60;
+
+    if (!switch2_triggered) {
+        Serial.print("2号电机: 开始反转回零... ");
+        byte v1, v2;
+        splitSpeed(speed, &v1, &v2);
+        byte cmd2_run[] = {
+            0x02,
+            0xF6,
+            0x00,
+            v1,
+            v2,
+            0x00,
+            0x00,
+            MOTOR_FIXED_CHECKSUM
+        };
+        MOTOR_SERIAL.write(cmd2_run, sizeof(cmd2_run));
+        delay(50);
+        Serial.println("速度命令已发送");
+    }
+
+    if (!switch4_triggered) {
+        Serial.print("4号电机: 开始反转回零... ");
+        byte v1, v2;
+        splitSpeed(speed, &v1, &v2);
+        byte cmd4_run[] = {
+            0x04,
+            0xF6,
+            0x00,
+            v1,
+            v2,
+            0x00,
+            0x00,
+            MOTOR_FIXED_CHECKSUM
+        };
+        MOTOR_SERIAL.write(cmd4_run, sizeof(cmd4_run));
+        delay(50);
+        Serial.println("速度命令已发送");
+    }
+
+    unsigned long startTime = millis();
+    const unsigned long timeout = 30000;
+    Serial.print("开始监测限位(超时时间: "); Serial.print(timeout); Serial.println("ms)...");
+
+    while (true) {
+        if (!switch2_triggered && digitalRead(LIMIT_SWITCH_2_PIN) == LOW) {
+            Serial.println("2号电机: 限位触发，立即停止并清零位置");
+            byte stop2[] = {0x02, 0xFE, 0x98, 0x00, MOTOR_FIXED_CHECKSUM};
+            MOTOR_SERIAL.write(stop2, sizeof(stop2));
+            delay(10);
+            switch2_triggered = true;
+        }
+
+        if (!switch4_triggered && digitalRead(LIMIT_SWITCH_4_PIN) == LOW) {
+            Serial.println("4号电机: 限位触发，立即停止并清零位置");
+            byte stop4[] = {0x04, 0xFE, 0x98, 0x00, MOTOR_FIXED_CHECKSUM};
+            MOTOR_SERIAL.write(stop4, sizeof(stop4));
+            delay(10);
+            switch4_triggered = true;
+        }
+
+        if (switch2_triggered && switch4_triggered) {
+            byte cmd2_zero[] = {0x02, 0x0A, 0x6D, MOTOR_FIXED_CHECKSUM};
+            MOTOR_SERIAL.write(cmd2_zero, sizeof(cmd2_zero));
+            delay(50);
+            Serial.println("2号电机: 回零完成");
+            byte cmd4_zero[] = {0x04, 0x0A, 0x6D, MOTOR_FIXED_CHECKSUM};
+            MOTOR_SERIAL.write(cmd4_zero, sizeof(cmd4_zero));
+            delay(50);
+            Serial.println("4号电机: 回零完成");
+            Serial.println("========== 全部回零完成 ==========\n");
+            break;
+        }
+
+        if (millis() - startTime > timeout) {
+            Serial.println("!!! 回零超时 !!! 强制停止");
+            if (!switch2_triggered) {
+                byte stop2[] = {0x02, 0xFE, 0x98, 0x00, MOTOR_FIXED_CHECKSUM};
+                MOTOR_SERIAL.write(stop2, sizeof(stop2));
+                delay(50);
+            }
+            if (!switch4_triggered) {
+                byte stop4[] = {0x04, 0xFE, 0x98, 0x00, MOTOR_FIXED_CHECKSUM};
+                MOTOR_SERIAL.write(stop4, sizeof(stop4));
+                delay(50);
+            }
+            break;
+        }
+
+        delay(1);
+    }
+}
+
+// ============================================================
+// ★ 单电机步进（独立启动，不等待同步指令）
+// ============================================================
+void motor_step(byte motorId, byte direction, unsigned long steps, word speed) {
+    byte v1 = highByte(speed);
+    byte v2 = lowByte(speed);
+    
+    byte cmd[13] = {
+        motorId,                    // [0] 电机地址
+        0xFD,                       // [1] 位置控制指令
+        direction,                  // [2] 方向
+        v1,                         // [3] 速度高字节
+        v2,                         // [4] 速度低字节
+        0x8C,                       // [5] 加速度（默认值）
+        (byte)(steps >> 24),        // [6] 脉冲数第1字节（最高字节）
+        (byte)(steps >> 16),        // [7] 脉冲数第2字节
+        (byte)(steps >> 8),         // [8] 脉冲数第3字节
+        (byte)(steps),              // [9] 脉冲数第4字节（最低字节）
+        0x01,                       // [10] 相对位置模式
+        0x00,                       // [11] 立即执行 = 0x00（不等待同步信号，立即启动）
+        MOTOR_FIXED_CHECKSUM        // [12] 校验
+    };
+    
+    MOTOR_SERIAL.write(cmd, sizeof(cmd));
+    delay(10);
+}
+
+// ============================================================
+// ★ 双电机同步步进（推荐使用）
+//    先分别设置两个电机的参数，然后发送同步启动指令
+// ============================================================
+void motor_step_sync(byte direction, unsigned long steps, word speed) {
+    byte v1 = highByte(speed);
+    byte v2 = lowByte(speed);
+    byte d1 = (byte)(steps >> 24);
+    byte d2 = (byte)(steps >> 16);
+    byte d3 = (byte)(steps >> 8);
+    byte d4 = (byte)(steps);
+    
+    // ===== 第1步：设置2号电机参数（同步标志 = 0x01，等待同步信号） =====
+    byte cmd2[13] = {
+        0x02,                       // [0] 电机地址：2号
+        0xFD,                       // [1] 位置控制指令
+        direction,                  // [2] 方向
+        v1,                         // [3] 速度高字节
+        v2,                         // [4] 速度低字节
+        0x8C,                       // [5] 加速度
+        d1, d2, d3, d4,             // [6-9] 脉冲数（4字节）
+        0x01,                       // [10] 相对位置模式
+        0x01,                       // [11] ★ 同步标志 = 0x01（等待同步信号）
+        MOTOR_FIXED_CHECKSUM        // [12] 校验
+    };
+    MOTOR_SERIAL.write(cmd2, sizeof(cmd2));
+    delay(50);  // 给电机模块处理时间
+    
+    // ===== 第2步：设置4号电机参数（同步标志 = 0x01，等待同步信号） =====
+    byte cmd4[13] = {
+        0x04,                       // [0] 电机地址：4号
+        0xFD,                       // [1] 位置控制指令
+        direction,                  // [2] 方向
+        v1,                         // [3] 速度高字节
+        v2,                         // [4] 速度低字节
+        0x8C,                       // [5] 加速度
+        d1, d2, d3, d4,             // [6-9] 脉冲数（4字节）
+        0x01,                       // [10] 相对位置模式
+        0x01,                       // [11] ★ 同步标志 = 0x01（等待同步信号）
+        MOTOR_FIXED_CHECKSUM        // [12] 校验
+    };
+    MOTOR_SERIAL.write(cmd4, sizeof(cmd4));
+    delay(50);
+    
+    // ===== 第3步：发送同步启动指令，两个电机同时启动 =====
+    MOTOR_SERIAL.write(together_Motor, sizeof(together_Motor));
+    
+    Serial.print(F("[电机] 双电机同步步进: 方向="));
+    Serial.print(direction == 0x00 ? F("伸出") : F("收回"));
+    Serial.print(F(" 步数="));
+    Serial.print(steps);
+    Serial.print(F(" 速度="));
+    Serial.print(speed);
+    Serial.println(F("RPM"));
+}
+
+// ============================================================
+// ★ 双电机异步步进（各自独立启动，不等待同步信号）
+// ============================================================
+void motor_step_async(byte direction, unsigned long steps, word speed) {
+    byte v1 = highByte(speed);
+    byte v2 = lowByte(speed);
+    byte d1 = (byte)(steps >> 24);
+    byte d2 = (byte)(steps >> 16);
+    byte d3 = (byte)(steps >> 8);
+    byte d4 = (byte)(steps);
+    
+    // ===== 2号电机：立即执行 =====
+    byte cmd2[13] = {
+        0x02, 0xFD, direction,
+        v1, v2,
+        0x8C,
+        d1, d2, d3, d4,
+        0x01,       // 相对位置模式
+        0x00,       // ★ 立即执行
+        MOTOR_FIXED_CHECKSUM
+    };
+    MOTOR_SERIAL.write(cmd2, sizeof(cmd2));
+    delay(10);
+    
+    // ===== 4号电机：立即执行 =====
+    byte cmd4[13] = {
+        0x04, 0xFD, direction,
+        v1, v2,
+        0x8C,
+        d1, d2, d3, d4,
+        0x01,       // 相对位置模式
+        0x00,       // ★ 立即执行
+        MOTOR_FIXED_CHECKSUM
+    };
+    MOTOR_SERIAL.write(cmd4, sizeof(cmd4));
+    delay(10);
+    
+    Serial.print(F("[电机] 双电机异步步进: 方向="));
+    Serial.print(direction == 0x00 ? F("伸出") : F("收回"));
+    Serial.print(F(" 步数="));
+    Serial.print(steps);
+    Serial.print(F(" 速度="));
+    Serial.print(speed);
+    Serial.println(F("RPM"));
+}
+
+// ============================================================
+// 读取电机当前位置（同步阻塞方式）
+// ============================================================
+long motor_read_position(byte motorId) {
+    // 清空接收缓冲区
+    while (MOTOR_SERIAL.available()) {
+        MOTOR_SERIAL.read();
+    }
+    
+    // 发送读取位置命令
+    byte cmd[] = {motorId, 0x36, MOTOR_FIXED_CHECKSUM};
+    MOTOR_SERIAL.write(cmd, sizeof(cmd));
+    
+    // 等待响应（超时500ms）
+    unsigned long startTime = millis();
+    while (millis() - startTime < 500) {
+        // ★ 改为等8字节
+        if (MOTOR_SERIAL.available() >= 8) {
+            byte response[8];
+            int bytesRead = 0;
+            
+            while (MOTOR_SERIAL.available() && bytesRead < 8) {
+                response[bytesRead++] = MOTOR_SERIAL.read();
+            }
+            
+            if (bytesRead >= 8) {
+                // ★ 校验第7字节
+                if (response[0] == motorId && 
+                    response[1] == 0x36 && 
+                    response[7] == MOTOR_FIXED_CHECKSUM) {
+                    
+                    byte sign = response[2];
+                    long rawPos = ((long)response[3] << 24) | 
+                                  ((long)response[4] << 16) | 
+                                  ((long)response[5] << 8) | 
+                                  (long)response[6];
+                    
+                    return (sign == 0x01) ? -rawPos : rawPos;
+                }
+            }
+        }
+        delay(1);
+    }
+    
+    return -1;
+}
+
+// ============================================================
+// 批量读取所有电机位置
+// ============================================================
+uint8_t motor_read_all_positions(long* positions) {
+    // ★ 2号电机数据暂不可用，只读取4号电机，两个槽位都填4号数据
+    long pos = motor_read_position(0x04);
+    positions[0] = pos;  // 2号电机位置 → 使用4号数据
+    positions[1] = pos;  // 4号电机位置 → 4号数据
+    return (pos >= 0) ? 2 : 0;
+}
+
+// ============================================================
+// 处理电机返回数据（非阻塞，在 loop 中调用）
+// ============================================================
+bool motor_process_response() {
+    if (MOTOR_SERIAL.available() < 7) {
+        return false;
+    }
+    
+    byte response[7];
+    int bytesRead = 0;
+    
+    unsigned long startTime = millis();
+    while (MOTOR_SERIAL.available() && bytesRead < 7) {
+        response[bytesRead++] = MOTOR_SERIAL.read();
+        if (millis() - startTime > 100) break;
+    }
+    
+    if (bytesRead < 7) return false;
+    if (response[1] != 0x36) return false;
+    if (response[6] != MOTOR_FIXED_CHECKSUM) return false;
+    
+    _lastPosition = ((long)response[2] << 24) | 
+                   ((long)response[3] << 16) | 
+                   ((long)response[4] << 8) | 
+                   (long)response[5];
+    _newPositionData = true;
+    
+    return true;
+}
+
+// ============================================================
+// 获取最近一次读取的电机位置
+// ============================================================
+long get_last_motor_position() {
+    return _lastPosition;
+}
+
+// ============================================================
+// 是否有新的位置数据
+// ============================================================
+bool has_new_position_data() {
+    if (_newPositionData) {
+        _newPositionData = false;
+        return true;
+    }
+    return false;
+}
+
+
+
+--------------------------------------------------------------------------------
+
+===== motor_control.h =====
+#ifndef MOTOR_CONTROL_H
+#define MOTOR_CONTROL_H
+
+#include <Arduino.h>
+
+/************************************************
+ * 硬件配置定义
+ ************************************************/
+#define MOTOR_SERIAL       Serial3
+#define MOTOR_BAUD_RATE    115200
+
+/************************************************
+ * 通信协议固定参数
+ ************************************************/
+#define MOTOR_FIXED_CHECKSUM  0x6B
+
+/************************************************
+ * 限位开关引脚定义（NPN输出：无遮挡高电平，遮挡低电平）
+ * D4 → 2号电机的限位开关    
+ * D5 → 4号电机的限位开关     4电机-d5
+ ************************************************/
+#define LIMIT_SWITCH_2_PIN   8
+#define LIMIT_SWITCH_4_PIN   9
+
+/************************************************
+ * 回零速度参数（单位：RPM）
+ ************************************************/
+#define HOMING_SPEED        5
+
+/************************************************
+ * 外部可调用函数声明
+ ************************************************/
+
+void motor_init(void);
+void To_arm(void);
+void back(void);
+void motor_stop_all(void);
+void motor_homing(void);
+
+// ========== 电机控制函数 ==========
+
+/**
+ * @brief  读取电机当前位置 （阻塞）
+ * @param  motorId 电机ID (0x02 或 0x04)
+ * @return 当前位置脉冲数，失败返回 -1
+ */
+long motor_read_position(byte motorId);
+
+/**
+ * @brief  启动异步位置读取
+ * @param  motorId 电机ID (0x02 或 0x04)
+ * @return true:请求已发送 false:上一个请求未完成
+ * @note   发送请求后需要在loop中调用 motor_get_position_async_result 获取结果
+ */
+bool motor_request_position_async(byte motorId);
+
+/**
+ * @brief  检查异步读取结果
+ * @param  position 输出参数，存储位置值
+ * @return true:结果就绪（成功/超时） false:仍在等待
+ */
+bool motor_get_position_async_result(long* position);
+
+/**
+ * @brief  取消异步请求
+ */
+void motor_cancel_async_request();
+
+// ========== 双电机轮询读取 ==========
+
+/**
+ * @brief  启动双电机轮询（在loop中重复调用）
+ * @details 自动轮流读取两个电机，结果缓存到内部数组
+ *          通过 motor_get_cached_position 获取缓存值
+ */
+void motor_poll_positions();
+
+/**
+ * @brief  获取缓存的电机位置
+ * @param  motorId 电机ID (0x02 或 0x04)
+ * @return 位置值，-1无效
+ */
+long motor_get_cached_position(byte motorId);
+
+/**
+ * @brief  检查缓存位置是否有效
+ */
+bool motor_is_position_valid(byte motorId);
+
+/**
+ * @brief  检查两个电机位置是否都有效
+ */
+bool motor_both_positions_valid();
+
+bool motor_both_reached();
+bool motor_get_cached_reached(byte motorId);
+
+
+/**
+ * @brief  检查到位状态是否有效
+ * @return true:到位状态有效 false:需要重新查询
+ */
+bool motor_is_reached_valid();
+
+/**
+ * @brief  获取运动开始时间
+ * @return 运动开始时的millis()值，0表示电机未在运动
+ */
+unsigned long motor_get_move_start_time();
+
+/**
+ * @brief  使缓存位置失效
+ */
+void motor_invalidate_positions();
+
+void motor_invalidate_reached();
+
+// ★ 新增函数声明
+void motor_notify_move_started();   // 通知电机开始运动
+void motor_clear_rx_buffer();       // 清空串口缓冲区
+
+/**
+ * @brief  电机单步步进（单电机）
+ * @param  motorId 电机ID (0x02 或 0x04)
+ * @param  direction 方向 (0x00=CW正转, 0x01=CCW反转)
+ * @param  steps 步进步数
+ * @param  speed 速度 (RPM)
+ */
+void motor_step(byte motorId, byte direction, unsigned long steps, word speed);
+
+/**
+ * @brief  双电机同步步进
+ * @param  direction 方向 (0x00=CW正转, 0x01=CCW反转)
+ * @param  steps 步进步数
+ * @param  speed 速度 (RPM)
+ * @note   两个电机同时接收指令，同步启动运行
+ */
+void motor_step_sync(byte direction, unsigned long steps, word speed);
+
+/**
+ * @brief  双电机异步步进（不同步启动）
+ * @param  direction 方向 (0x00=CW正转, 0x01=CCW反转)
+ * @param  steps 步进步数
+ * @param  speed 速度 (RPM)
+ * @note   两个电机各自独立启动
+ */
+void motor_step_async(byte direction, unsigned long steps, word speed);
+
+/**
+ * @brief  批量读取所有电机位置
+ * @param  positions 存储位置的数组（至少2个元素）
+ * @return 成功读取的电机数量
+ */
+uint8_t motor_read_all_positions(long* positions);
+
+/**
+ * @brief  处理电机返回数据（需要在 loop 中调用）
+ * @return true:收到新数据
+ */
+bool motor_process_response();
+
+/**
+ * @brief  获取最近一次读取的电机位置
+ */
+long get_last_motor_position();
+
+/**
+ * @brief  是否有新的位置数据
+ */
+bool has_new_position_data();
+
+#endif
+
+--------------------------------------------------------------------------------
+
+===== MY2901.cpp =====
+/*
+ * ================================================================
+ *  MY2901.cpp — MY2901 驱动实现
+ * ================================================================
+ */
+
+#include "MY2901.h"
+
+// -------------------- 构造函数 --------------------
+MY2901::MY2901(Stream *serial)
+  : _serial(serial),       // 保存串口对象
+    _rxIdx(0),             // 接收索引归零
+    _lastRxTime(0),        // 上次接收时间归零
+    _format(MY2901_BCD),   // 默认BCD格式
+    _newData(false)        // 还没有新数据
+{
+  // 所有AD值初始化为0
+  memset(_adValues, 0, sizeof(_adValues));
+}
+
+// -------------------- 初始化 --------------------
+void MY2901::begin() {
+  _rxIdx = 0;
+  _newData = false;
+  memset(_adValues, 0, sizeof(_adValues));
+  // 使用出厂默认设置，不发送配置命令
+  // （SoftwareSerial在115200波特率下发送命令不可靠）
+}
+
+// -------------------- 更新（在loop中反复调用） --------------------
+bool MY2901::update() {
+  _newData = false;
+
+  // 读取串口缓冲区里所有可用的字节
+  while (_serial->available()) {
+    uint8_t b = _serial->read();         // 读一个字节
+    unsigned long now = millis();         // 当前时间
+
+    // === 帧超时检测 ===
+    // 如果已经开始接收(rxIdx>0)，但超过200ms没收到下一个字节
+    // 说明数据中断了，需要重新开始寻找帧头
+    if (_rxIdx > 0 && (now - _lastRxTime) > MY2901_FRAME_TIMEOUT) {
+      _rxIdx = 0;
+    }
+    _lastRxTime = now;  // 记录这次收到字节的时间
+
+    // === 第1步：寻找帧头 0xFF ===
+    if (_rxIdx == 0) {
+      if (b == MY2901_FRAME_HEADER) {
+        _rxBuf[0] = b;   // 存储帧头
+        _rxIdx = 1;       // 开始接收后续字节
+      }
+      continue;           // 还没找到帧头就继续找
+    }
+
+    // === 第2步：存储后续字节 ===
+    if (_rxIdx < MY2901_FRAME_LEN) {
+      _rxBuf[_rxIdx] = b;
+      _rxIdx++;
+    } else {
+      // 超出帧长度，出错了，重新开始
+      _rxIdx = 0;
+      continue;
+    }
+
+    // === 第3步：收满20字节 = 一帧完整数据 ===
+    if (_rxIdx >= MY2901_FRAME_LEN) {
+      parseFrame(_rxBuf);   // 解析这一帧
+      _rxIdx = 0;           // 重置，准备接收下一帧
+    }
+  }
+
+  return _newData;
+}
+
+// -------------------- 获取单通道AD值 --------------------
+uint16_t MY2901::getAD(uint8_t channel) {
+  if (channel >= MY2901_TOTAL_CHANNELS) return 0;
+  return _adValues[channel];
+}
+
+// -------------------- 批量获取AD值 --------------------
+void MY2901::getMultiAD(uint16_t *destArray, uint8_t count) {
+  // count不能超过总通道数
+  if (count > MY2901_TOTAL_CHANNELS) {
+    count = MY2901_TOTAL_CHANNELS;
+  }
+  // 把内部存储的AD值复制到用户提供的数组
+  for (uint8_t i = 0; i < count; i++) {
+    destArray[i] = _adValues[i];
+  }
+}
+
+// -------------------- 解析数据帧 --------------------
+void MY2901::parseFrame(uint8_t *frame) {
+  // 八通道帧结构:
+  // frame[0]  = 0xFF (帧头)
+  // frame[1]  = 命令1
+  // frame[2]  = 命令2
+  // frame[3]  = S0高字节    frame[4]  = S0低字节
+  // frame[5]  = S1高字节    frame[6]  = S1低字节
+  // frame[7]  = S2高字节    frame[8]  = S2低字节
+  // frame[9]  = S3高字节    frame[10] = S3低字节
+  // frame[11] = S4高字节    frame[12] = S4低字节
+  // frame[13] = S5高字节    frame[14] = S5低字节
+  // frame[15] = S6高字节    frame[16] = S6低字节
+  // frame[17] = S7高字节    frame[18] = S7低字节
+  // frame[19] = 校验和
+
+  for (uint8_t ch = 0; ch < MY2901_TOTAL_CHANNELS; ch++) {
+    uint8_t hi = frame[3 + ch * 2];   // 高字节
+    uint8_t lo = frame[4 + ch * 2];   // 低字节
+
+    if (_format == MY2901_HEX) {
+      _adValues[ch] = decodeHEX(hi, lo);
+    } else {
+      _adValues[ch] = decodeBCD(hi, lo);
+    }
+  }
+
+  _newData = true;  // 标记有新数据
+}
+
+// -------------------- BCD解码 --------------------
+// 例: hi=0x12, lo=0x34 → 1234
+uint16_t MY2901::decodeBCD(uint8_t hi, uint8_t lo) {
+  uint16_t thousands = (hi >> 4) & 0x0F;   // 千位
+  uint16_t hundreds  = hi & 0x0F;           // 百位
+  uint16_t tens      = (lo >> 4) & 0x0F;   // 十位
+  uint16_t ones      = lo & 0x0F;           // 个位
+  return thousands * 1000 + hundreds * 100 + tens * 10 + ones;
+}
+
+// -------------------- HEX解码 --------------------
+// 例: hi=0x0C, lo=0xD3 → 0x0CD3 = 3283
+uint16_t MY2901::decodeHEX(uint8_t hi, uint8_t lo) {
+  return ((uint16_t)hi << 8) | lo;
+}
+
+--------------------------------------------------------------------------------
+
+===== MY2901.h =====
+/*
+ * ================================================================
+ *  MY2901.h — MY2901 八通道数字转换模块 驱动程序
+ * ================================================================
+ *
+ *  功能说明:
+ *    MY2901 是一个把薄膜压力传感器的模拟信号转成数字值(AD值)的模块。
+ *    它通过串口(UART)以固定格式发送数据给Arduino。
+ *
+ *  数据帧格式 (八通道, 20字节):
+ *    字节1:    0xFF (帧头，表示一帧数据的开始)
+ *    字节2~3:  命令字节 (通常是 0x00 0x00)
+ *    字节4~5:  通道S0的AD值 (高字节在前)
+ *    字节6~7:  通道S1的AD值
+ *    字节8~9:  通道S2的AD值
+ *    字节10~11: 通道S3的AD值
+ *    字节12~13: 通道S4的AD值
+ *    字节14~15: 通道S5的AD值
+ *    字节16~17: 通道S6的AD值
+ *    字节18~19: 通道S7的AD值
+ *    字节20:   校验和
+ *
+ *  通讯参数:
+ *    波特率: 115200
+ *    数据位: 8
+ *    停止位: 1
+ *    校验位: 无
+ *
+ * ================================================================
+ */
+
+#ifndef MY2901_H
+#define MY2901_H
+
+#include <Arduino.h>
+
+// ==================== MY2901 硬件参数 ====================
+
+#define MY2901_TOTAL_CHANNELS  8      // MY2901总共有8个通道
+#define MY2901_FRAME_LEN       20     // 八通道数据帧长度 (字节)
+#define MY2901_CMD_FRAME_LEN   12     // 命令帧长度 (字节)
+#define MY2901_FRAME_HEADER    0xFF   // 帧头标记
+#define MY2901_BAUD_RATE       115200 // 串口波特率
+#define MY2901_FRAME_TIMEOUT   200    // 帧超时时间(毫秒)，超过这个时间没收到下一个字节就重新开始
+
+// ==================== 数据格式枚举 ====================
+// MY2901可以用两种格式发送AD值，默认是BCD
+enum MY2901_Format {
+  MY2901_BCD = 0,    // BCD码: 0x34 0x21 表示 3421
+  MY2901_HEX = 1     // 十六进制: 0x0C 0xD3 表示 0x0CD3 = 3283
+};
+
+
+// ==================== MY2901 类 ====================
+class MY2901 {
+
+public:
+
+  /*
+   * 构造函数
+   * 参数 serial: 串口对象的指针
+   *   - 如果用 SoftwareSerial，就传 &mySerial
+   *   - 如果用 Arduino Mega 的 Serial1，就传 &Serial1
+   */
+  MY2901(Stream *serial);
+
+  /*
+   * 初始化
+   * 在 setup() 里调用一次
+   */
+  void begin();
+
+  /*
+   * 更新数据
+   * 在 loop() 里反复调用，它会自动接收和解析MY2901发来的数据
+   * 返回值:
+   *   true  = 刚刚收到了一帧完整数据
+   *   false = 还没收到新数据
+   */
+  bool update();
+
+  /*
+   * 获取某个通道的AD值
+   * 参数 channel: 通道号 0~7
+   * 返回值: AD值 0~4095
+   */
+  uint16_t getAD(uint8_t channel);
+
+  /*
+   * 批量获取多个通道的AD值，存到你提供的数组里
+   * 参数 destArray: 你的数组（用来存结果）
+   * 参数 count:     要获取几个通道（从通道0开始）
+   */
+  void getMultiAD(uint16_t *destArray, uint8_t count);
+
+
+private:
+
+  Stream        *_serial;                         // 串口对象
+  uint8_t        _rxBuf[MY2901_FRAME_LEN + 2];   // 接收缓冲区
+  uint8_t        _rxIdx;                          // 当前接收到第几个字节
+  unsigned long  _lastRxTime;                     // 上次收到字节的时间
+  uint16_t       _adValues[MY2901_TOTAL_CHANNELS];// 8个通道的AD值
+  MY2901_Format  _format;                         // 当前数据格式
+  bool           _newData;                        // 是否有新数据
+
+  // 内部函数（你不需要直接调用）
+  void     parseFrame(uint8_t *frame);            // 解析一帧数据
+  uint16_t decodeBCD(uint8_t hi, uint8_t lo);     // BCD解码
+  uint16_t decodeHEX(uint8_t hi, uint8_t lo);     // HEX解码
+};
+
+#endif // MY2901_H
+
+--------------------------------------------------------------------------------
+
+===== PressureSensor.cpp =====
+/*
+ * ================================================================
+ * PressureSensor.cpp — 压力传感器实现 (优化版)
+ * ================================================================
+ */
+
+#include "PressureSensor.h"
+
+// -------------------- 构造函数 --------------------
+PressureSensor::PressureSensor()
+    : _calCount(0), _baseline(BASELINE_AD) {
+}
+
+// -------------------- 初始化 --------------------
+void PressureSensor::begin() {
+    // 加载校准数据
+    _calCount = min((uint8_t)CAL_POINTS, (uint8_t)MAX_CAL_POINTS);
+    
+    for (uint8_t i = 0; i < _calCount; i++) {
+        _calAD[i] = CAL_AD[i];
+        _calForce[i] = CAL_FORCE[i];
+    }
+    
+    _baseline = BASELINE_AD;
+    
+    // 验证校准表
+    if (!validateCalibration()) {
+        // 校准表有问题，使用默认线性映射
+        _calCount = 2;
+        _calAD[0] = 0;
+        _calAD[1] = 4095;
+        _calForce[0] = 0;
+        _calForce[1] = FORCE_MAX;
+    }
+}
+
+// -------------------- AD值转压力值 --------------------
+long PressureSensor::adToForce(uint16_t adValue) {
+    // 底噪过滤
+    if (adValue <= _baseline) {
+        return 0;
+    }
+    
+    // 数据不足
+    if (_calCount < 2) {
+        return 0;
+    }
+    
+    // 低于最小校准点
+    if (adValue <= _calAD[0]) {
+        return 0;
+    }
+    
+    // 超过最大校准点
+    if (adValue >= _calAD[_calCount - 1]) {
+        return _calForce[_calCount - 1];
+    }
+    
+    // 分段线性插值
+    for (uint8_t i = 0; i < _calCount - 1; i++) {
+        if (adValue <= _calAD[i + 1]) {
+            return interpolate(adValue, i);
+        }
+    }
+    
+    return 0;
+}
+
+// -------------------- 线性插值 --------------------
+long PressureSensor::interpolate(uint16_t ad, uint8_t idx) {
+    // 公式: F = F1 + (AD - AD1) * (F2 - F1) / (AD2 - AD1)
+    
+    long ad1 = _calAD[idx];
+    long ad2 = _calAD[idx + 1];
+    long f1 = _calForce[idx];
+    long f2 = _calForce[idx + 1];
+    
+    // 防止除零
+    if (ad2 == ad1) {
+        return f1;
+    }
+    
+    // 线性插值
+    long force = f1 + ((long)(ad - ad1) * (f2 - f1)) / (ad2 - ad1);
+    
+    // 限制在合理范围
+    if (force < 0) force = 0;
+    if (force > FORCE_MAX) force = FORCE_MAX;
+    
+    return force;
+}
+
+// -------------------- 批量转换 --------------------
+void PressureSensor::batchConvert(uint16_t *adArray, long *forceArray, uint8_t count) {
+    for (uint8_t i = 0; i < count; i++) {
+        forceArray[i] = adToForce(adArray[i]);
+    }
+}
+
+// -------------------- 验证校准表 --------------------
+bool PressureSensor::validateCalibration() {
+    if (_calCount < 2) {
+        return false;
+    }
+    
+    // 检查AD值是否递增
+    for (uint8_t i = 0; i < _calCount - 1; i++) {
+        if (_calAD[i] >= _calAD[i + 1]) {
+            return false;
+        }
+    }
+    
+    // 检查压力值是否递增
+    for (uint8_t i = 0; i < _calCount - 1; i++) {
+        if (_calForce[i] > _calForce[i + 1]) {
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+// -------------------- 获取校准信息 --------------------
+void PressureSensor::getCalibrationInfo(char *buffer, size_t bufferSize) {
+    snprintf(buffer, bufferSize, 
+             "校准点数:%d, 基线:%d, 范围:%d-%dg",
+             _calCount, _baseline, _calForce[0], _calForce[_calCount-1]);
+}
+
+--------------------------------------------------------------------------------
+
+===== PressureSensor.h =====
+/*
+ * ================================================================
+ * PressureSensor.h — 压力传感器转换模块 (优化版)
+ * ================================================================
+ */
+
+#ifndef PRESSURE_SENSOR_H
+#define PRESSURE_SENSOR_H
+
+#include <Arduino.h>
+#include "config.h"
+
+#define MAX_CAL_POINTS 16
+
+class PressureSensor {
+public:
+    PressureSensor();
+    
+    // 初始化
+    void begin();
+    
+    // 单值转换
+    long adToForce(uint16_t adValue);
+    
+    // 批量转换
+    void batchConvert(uint16_t *adArray, long *forceArray, uint8_t count);
+    
+    // 获取校准信息
+    void getCalibrationInfo(char *buffer, size_t bufferSize);
+    
+    // 验证校准表
+    bool validateCalibration();
+
+private:
+    uint16_t _calAD[MAX_CAL_POINTS];
+    uint16_t _calForce[MAX_CAL_POINTS];
+    uint8_t _calCount;
+    uint16_t _baseline;
+    
+    // 线性插值计算
+    long interpolate(uint16_t ad, uint8_t segmentIndex);
+};
+
+#endif // PRESSURE_SENSOR_H
+
+--------------------------------------------------------------------------------
+
+===== ServoController.cpp =====
+#include "ServoController.h"
+
+// 构造函数
+ServoController::ServoController(uint8_t i2cAddress)
+  : pwm(Adafruit_PWMServoDriver(i2cAddress)),
+    channels(nullptr),
+    count(0) {
+  // 初始化PID变量（每个通道独立参数，与参考版本一致）
+  for (int i = 0; i < PID_CHANNEL_COUNT; i++) {
+    currentPWM[i] = PID_INIT_PWM;
+    lastError[i] = 0;
+    integral[i] = 0;
+  }
+  // 六个通道独立的PID参数（从PID调试项目获取）
+  targetForce[0] = 15.0; kp[0] = 1.0; ki[0] = 0.0; kd[0] = 0.0;
+  targetForce[1] = 20.0; kp[1] = 0.35; ki[1] = 0.0; kd[1] = 0.0;
+  targetForce[2] = 20.0; kp[2] = 0.5; ki[2] = 0.0; kd[2] = 0.0;
+  targetForce[3] = 20.0; kp[3] = 0.4; ki[3] = 0.0; kd[3] = 0.0;
+  targetForce[4] = 7.0;  kp[4] = 1.5; ki[4] = 0.0; kd[4] = 0.0;
+  targetForce[5] = 20.0; kp[5] = 0.3; ki[5] = 0.0; kd[5] = 0.0;
+}
+
+// 初始化 PCA9685
+void ServoController::begin() {
+  pwm.begin();
+  pwm.setPWMFreq(SERVO_FREQ);
+  delay(10);
+}
+
+// 设置要控制的舵机通道
+void ServoController::setChannels(const uint8_t* servoChannels, uint8_t servoCount) {
+  channels = servoChannels;
+  count = servoCount;
+}
+
+// 单个舵机控制
+void ServoController::setPulse(uint8_t channel, uint16_t pulseValue) {
+  pulseValue = constrain(pulseValue, PULSE_MIN, PULSE_MAX);
+  pwm.setPWM(channel, 0, pulseValue);
+}
+
+// 控制所有已设置的舵机
+void ServoController::setAllServos(uint16_t pulseValue) {
+  pulseValue = constrain(pulseValue, PULSE_MIN, PULSE_MAX);
+  for (uint8_t i = 0; i < count; i++) {
+    pwm.setPWM(channels[i], 0, pulseValue);
+  }
+}
+
+// 新增:使用PID控制设置所有舵机
+void ServoController::setAllServosWithPID(uint16_t initialPWM) {
+  for (uint8_t i = 0; i < count; i++) {
+    currentPWM[i] = initialPWM;
+    lastError[i] = 0;
+    integral[i] = 0;
+    pwm.setPWM(channels[i], 0, initialPWM);
+  }
+}
+
+// PID计算函数（使用当前通道的独立PID参数）
+uint16_t ServoController::calculatePID(float currentForce, uint8_t channel) {
+  if (channel >= PID_CHANNEL_COUNT) return currentPWM[channel];
+
+  // 使用当前通道独立的目标压力计算误差
+  float error = targetForce[channel] - currentForce;
+  
+  // 积分项（带抗饱和）
+  integral[channel] += error;
+  // 积分限幅，防止积分饱和
+  if (integral[channel] > 100.0f) integral[channel] = 100.0f;
+  if (integral[channel] < -100.0f) integral[channel] = -100.0f;
+  
+  // 微分项
+  float derivative = error - lastError[channel];
+  
+  // PID输出计算（使用当前通道独立的PID参数）
+  float pidCorrection = kp[channel] * error 
+                      + ki[channel] * integral[channel] 
+                      + kd[channel] * derivative;
+  
+  // 更新PWM值 (注意:error为正时需要减小PWM让舵机伸直)
+  float newPWM = currentPWM[channel] - pidCorrection;
+  
+  // 限制输出范围
+  newPWM = constrain(newPWM, PID_OUTPUT_MIN, PID_OUTPUT_MAX);
+  
+  // 保存当前误差
+  lastError[channel] = error;
+  
+  return (uint16_t)newPWM;
+}
+
+// 新增:根据压力反馈更新PID控制
+void ServoController::updatePIDControl(long* forceValues, uint8_t channelCount) {
+  for (uint8_t i = 0; i < channelCount && i < count; i++) {
+    float currentForce = (float)forceValues[i];
+    
+    // 计算新的PWM值
+    uint16_t newPWM = calculatePID(currentForce, i);
+    
+    // 只有PWM值变化才更新
+    if (newPWM != currentPWM[i]) {
+      currentPWM[i] = newPWM;
+      pwm.setPWM(channels[i], 0, newPWM);
+    }
+  }
+}
+
+// 角度转 PWM（仅用于调试参考，注释标注近似角度）
+uint16_t ServoController::angle2pwm(uint16_t angle) {
+  angle = constrain(angle, 0, 270);
+  return map(angle, 0, 270, PULSE_MIN, PULSE_MAX);
+}
+
+// ========== PID参数设置方法 ==========
+
+// 设置所有通道的PID参数和目标压力
+void ServoController::setPIDParams(float _kp, float _ki, float _kd, float _targetForce) {
+  for (uint8_t i = 0; i < PID_CHANNEL_COUNT; i++) {
+    kp[i] = _kp;
+    ki[i] = _ki;
+    kd[i] = _kd;
+    targetForce[i] = _targetForce;
+  }
+}
+
+// 设置单个通道的PID参数和目标压力
+void ServoController::setPIDParams(uint8_t channel, float _kp, float _ki, float _kd, float _targetForce) {
+  if (channel >= PID_CHANNEL_COUNT) return;
+  kp[channel] = _kp;
+  ki[channel] = _ki;
+  kd[channel] = _kd;
+  targetForce[channel] = _targetForce;
+}
+
+// 设置所有通道的目标压力
+void ServoController::setTargetForce(float _targetForce) {
+  for (uint8_t i = 0; i < PID_CHANNEL_COUNT; i++) {
+    targetForce[i] = _targetForce;
+  }
+}
+
+// 设置单个通道的目标压力
+void ServoController::setTargetForce(uint8_t channel, float _targetForce) {
+  if (channel >= PID_CHANNEL_COUNT) return;
+  targetForce[channel] = _targetForce;
+}
+
+
+--------------------------------------------------------------------------------
+
+===== ServoController.h =====
+#ifndef SERVO_CONTROLLER_H
+#define SERVO_CONTROLLER_H
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// 配置参数
+#define PULSE_MIN 102   // 最小 PWM 值 (≈0°)
+#define PULSE_MAX 512   // 最大 PWM 值 (≈270°)
+#define SERVO_FREQ 50   // PWM 频率
+
+// PID参数配置（默认值，每个通道可独立覆盖）
+#define PID_TARGET_FORCE 25.0   // 默认目标压力 (g)
+#define PID_KP 1.5              // 默认比例系数
+#define PID_KI 0.0              // 默认积分系数
+#define PID_KD 0.0              // 默认微分系数
+#define PID_OUTPUT_MIN 200      // PID输出最小值(伸直)
+#define PID_OUTPUT_MAX 275      // PID输出最大值(缩短)
+#define PID_INIT_PWM 237        // PID初始PWM值
+#define PID_CHANNEL_COUNT 6     // PID控制通道数
+
+// 定义舵机通道
+const uint8_t servoChannels[] = {0, 1, 2, 3, 4, 5};
+const uint8_t servoCount = sizeof(servoChannels) / sizeof(servoChannels[0]);
+
+class ServoController {
+private:
+  Adafruit_PWMServoDriver pwm;
+  const uint8_t* channels;  // 舵机通道数组
+  uint8_t count;            // 舵机数量
+  
+  // PID控制相关变量(每个通道独立)
+  uint16_t currentPWM[PID_CHANNEL_COUNT];   // 当前PWM值
+  float lastError[PID_CHANNEL_COUNT];       // 上次误差
+  float integral[PID_CHANNEL_COUNT];        // 积分累积
+
+  // 每个通道独立的PID参数
+  float targetForce[PID_CHANNEL_COUNT];     // 每个通道的目标压力(g)
+  float kp[PID_CHANNEL_COUNT];              // 每个通道的比例系数
+  float ki[PID_CHANNEL_COUNT];              // 每个通道的积分系数
+  float kd[PID_CHANNEL_COUNT];              // 每个通道的微分系数
+
+  // PID计算函数
+  uint16_t calculatePID(float currentForce, uint8_t channel);
+
+public:
+  // 构造函数
+  ServoController(uint8_t i2cAddress = 0x40);
+
+  // 初始化
+  void begin();
+
+  // 设置控制的舵机通道
+  void setChannels(const uint8_t* servoChannels, uint8_t servoCount);
+
+  // 核心控制函数 - 直接设置 PWM 值
+  void setPulse(uint8_t channel, uint16_t pulseValue);
+
+  // 批量控制
+  void setAllServos(uint16_t pulseValue);
+  
+  // 新增:使用PID控制设置所有舵机
+  void setAllServosWithPID(uint16_t initialPWM);
+  
+  // 新增:根据压力反馈更新PID控制
+  void updatePIDControl(long* forceValues, uint8_t channelCount);
+
+  // ========== PID参数设置方法 ==========
+
+  /**
+   * @brief 设置所有通道的PID参数和目标压力
+   * @param _kp 比例系数
+   * @param _ki 积分系数
+   * @param _kd 微分系数
+   * @param _targetForce 目标压力(g)
+   */
+  void setPIDParams(float _kp, float _ki, float _kd, float _targetForce);
+
+  /**
+   * @brief 设置单个通道的PID参数和目标压力
+   * @param channel 通道索引(0-5)
+   * @param _kp 比例系数
+   * @param _ki 积分系数
+   * @param _kd 微分系数
+   * @param _targetForce 目标压力(g)
+   */
+  void setPIDParams(uint8_t channel, float _kp, float _ki, float _kd, float _targetForce);
+
+  /**
+   * @brief 设置所有通道的目标压力
+   * @param _targetForce 目标压力(g)
+   */
+  void setTargetForce(float _targetForce);
+
+  /**
+   * @brief 设置单个通道的目标压力
+   * @param channel 通道索引(0-5)
+   * @param _targetForce 目标压力(g)
+   */
+  void setTargetForce(uint8_t channel, float _targetForce);
+
+      /**
+     * @brief 获取舵机当前PWM值
+     * @param index 舵机索引（0-5）
+     * @return PWM值
+     */
+    uint16_t getCurrentPWM(uint8_t index) const {
+        if (index < 6) return currentPWM[index];
+        return 0;
+    }
+    
+    /**
+     * @brief 将PWM值转换为角度（0-270°）
+     * @param pwm PWM值
+     * @return 角度值
+     */
+    float pwmToAngle(uint16_t pwm) const {
+        return (float)(pwm - PULSE_MIN) * 270.0f / (float)(PULSE_MAX - PULSE_MIN);
+    }
+    
+    /**
+     * @brief 获取所有舵机的当前角度
+     * @param angles 存储角度的数组（需至少6个元素）
+     */
+    void getCurrentAngles(float* angles) const {
+        for (uint8_t i = 0; i < count && i < 6; i++) {
+            angles[i] = pwmToAngle(currentPWM[i]);
+        }
+    }
+
+  // 工具函数（调试用）
+  uint16_t angle2pwm(uint16_t angle);
+};
+
+#endif
+
+--------------------------------------------------------------------------------
+
+===== TherapyStateMachine.cpp =====
+/*
+ * ================================================================
+ * TherapyStateMachine.cpp — 治疗状态机实现
+ * ================================================================
+ */
+
+#include "TherapyStateMachine.h"
+
+// ============================================================
+// 构造函数
+// ============================================================
+TherapyStateMachine::TherapyStateMachine()
+    : _currentState(STATE_IDLE)
+    , _previousState(STATE_IDLE)
+    , _therapyStartTime(0)
+    , _therapyEndTime(0)
+    , _pauseStartTime(0)
+    , _totalPauseTime(0)
+    , _therapyDuration(30)
+    , _wasConnected(true)
+    , _disconnectTime(0)
+    , _disconnectTimeout(10000)
+    , _autoStopDueToDisconnect(false)
+    , _stateChangeCallback(nullptr)
+{
+}
+
+// ============================================================
+// 初始化
+// ============================================================
+void TherapyStateMachine::begin() {
+    _currentState = STATE_IDLE;
+    _previousState = STATE_IDLE;
+    _autoStopDueToDisconnect = false;
+    _totalPauseTime = 0;
+}
+
+// ============================================================
+// 主循环更新
+// ============================================================
+TherapyState TherapyStateMachine::update() {
+    unsigned long currentTime = millis();
+
+    // 检查治疗是否超时（仅在运行状态）
+    if (_currentState == STATE_RUNNING) {
+        // 考虑暂停时间，调整结束时间判断
+        unsigned long adjustedTime = currentTime - _totalPauseTime;
+        if (_therapyEndTime > 0 && adjustedTime >= _therapyEndTime) {
+            _transitionTo(STATE_COMPLETED);
+        }
+    }
+
+    return _currentState;
+}
+
+// ============================================================
+// 开始治疗
+// ============================================================
+bool TherapyStateMachine::start(TherapyConfig& config) {
+    if (_currentState == STATE_EMERGENCY_STOP) {
+        return false;  // 急停状态下不允许开始
+    }
+
+    // 保存配置
+    _config = config;
+    _therapyDuration = config.duration;
+    if (_therapyDuration == 0) _therapyDuration = 30;
+
+    // 记录开始时间
+    _therapyStartTime = millis();
+    _therapyEndTime = _therapyStartTime + (unsigned long)_therapyDuration * 60000UL;
+    _totalPauseTime = 0;
+    _autoStopDueToDisconnect = false;
+    
+    // ★ 重置断连追踪，防止之前的断连状态误触发自动停止
+    _wasConnected = true;
+    _disconnectTime = millis();
+
+    _transitionTo(STATE_RUNNING);
+    return true;
+}
+
+// ============================================================
+// 暂停治疗
+// ============================================================
+bool TherapyStateMachine::pause() {
+    if (_currentState != STATE_RUNNING) {
+        return false;
+    }
+
+    _pauseStartTime = millis();
+    _transitionTo(STATE_PAUSED);
+    return true;
+}
+
+// ============================================================
+// 继续治疗
+// ============================================================
+bool TherapyStateMachine::resume() {
+    if (_currentState != STATE_PAUSED) {
+        return false;
+    }
+
+    // 计算暂停时长
+    if (_pauseStartTime > 0) {
+        _totalPauseTime += (millis() - _pauseStartTime);
+        _pauseStartTime = 0;
+    }
+
+    // 重新计算结束时间
+    _recalculateEndTime();
+
+    _transitionTo(STATE_RUNNING);
+    return true;
+}
+
+// ============================================================
+// 停止治疗
+// ============================================================
+bool TherapyStateMachine::stop() {
+    if (_currentState != STATE_RUNNING && _currentState != STATE_PAUSED) {
+        return false;
+    }
+
+    _transitionTo(STATE_IDLE);
+    return true;
+}
+
+// ============================================================
+// 紧急停止
+// ============================================================
+bool TherapyStateMachine::emergencyStop() {
+    if (_currentState == STATE_EMERGENCY_STOP) {
+        return false;
+    }
+
+    _transitionTo(STATE_EMERGENCY_STOP);
+    return true;
+}
+
+// ============================================================
+// 退出急停状态
+// ============================================================
+bool TherapyStateMachine::exitEmergencyStop() {
+    if (_currentState != STATE_EMERGENCY_STOP) {
+        return false;
+    }
+
+    _transitionTo(STATE_IDLE);
+    return true;
+}
+
+// ============================================================
+// 更新连接状态
+// ============================================================
+void TherapyStateMachine::updateConnectionStatus(bool connected, unsigned long disconnectDuration) {
+    // 检测连接状态变化
+    if (_wasConnected && !connected) {
+        // 从连接变为断开
+        _disconnectTime = millis();
+    } else if (!_wasConnected && connected) {
+        // 从断开变为连接
+        _autoStopDueToDisconnect = false;
+    }
+
+    // 如果治疗进行中且断开连接超过超时时间
+    if (isTherapyActive() && !connected) {
+        if (disconnectDuration >= _disconnectTimeout) {
+            _autoStopDueToDisconnect = true;
+            _transitionTo(STATE_IDLE);  // 自动停止
+        }
+    }
+
+    _wasConnected = connected;
+}
+
+// ============================================================
+// 获取已用时间（秒）
+// ============================================================
+unsigned long TherapyStateMachine::getElapsedSeconds() const {
+    if (_therapyStartTime == 0) return 0;
+
+    unsigned long elapsed = (millis() - _therapyStartTime - _totalPauseTime) / 1000;
+
+    // 如果在暂停中，不计算暂停期间的时间
+    if (_currentState == STATE_PAUSED && _pauseStartTime > 0) {
+        elapsed -= (millis() - _pauseStartTime) / 1000;
+    }
+
+    return elapsed;
+}
+
+// ============================================================
+// 获取剩余时间（秒）
+// ============================================================
+unsigned long TherapyStateMachine::getRemainingSeconds() const {
+    unsigned long total = getTotalSeconds();
+    unsigned long elapsed = getElapsedSeconds();
+
+    return (total > elapsed) ? (total - elapsed) : 0;
+}
+
+// ============================================================
+// 获取进度百分比
+// ============================================================
+uint8_t TherapyStateMachine::getProgressPercent() const {
+    unsigned long total = getTotalSeconds();
+    if (total == 0) return 0;
+
+    unsigned long elapsed = getElapsedSeconds();
+    uint8_t percent = (uint8_t)((elapsed * 100) / total);
+    
+    return (percent > 100) ? 100 : percent;
+}
+
+// ============================================================
+// 治疗是否已超时
+// ============================================================
+bool TherapyStateMachine::isTimeUp() const {
+    if (_currentState != STATE_RUNNING) return false;
+    if (_therapyEndTime == 0) return false;
+
+    return (millis() - _totalPauseTime) >= _therapyEndTime;
+}
+
+// ============================================================
+// 设置治疗模式
+// ============================================================
+void TherapyStateMachine::setMode(uint8_t mode) {
+    _config.mode = mode;
+    _config.configChanged = true;
+}
+
+// ============================================================
+// 设置治疗强度
+// ============================================================
+void TherapyStateMachine::setIntensity(uint8_t intensity) {
+    _config.intensity = intensity;
+    _config.configChanged = true;
+}
+
+// ============================================================
+// 设置治疗时长
+// ============================================================
+void TherapyStateMachine::setDuration(uint16_t duration) {
+    _config.duration = (duration == 0) ? 30 : duration;
+    _therapyDuration = _config.duration;
+    _config.configChanged = true;
+
+    // 如果治疗正在进行，重新计算结束时间
+    if (_currentState == STATE_RUNNING || _currentState == STATE_PAUSED) {
+        _recalculateEndTime();
+    }
+}
+
+// ============================================================
+// 获取状态名称字符串
+// ============================================================
+const char* TherapyStateMachine::getStateName() const {
+    return _stateToString(_currentState);
+}
+
+// ============================================================
+// 内部：状态转换
+// ============================================================
+void TherapyStateMachine::_transitionTo(TherapyState newState) {
+    if (_currentState == newState) return;
+
+    TherapyState oldState = _currentState;
+    _currentState = newState;
+
+    // 调用回调
+    if (_stateChangeCallback) {
+        _stateChangeCallback(oldState, newState);
+    }
+}
+
+// ============================================================
+// 内部：重新计算结束时间
+// ============================================================
+void TherapyStateMachine::_recalculateEndTime() {
+    _therapyEndTime = _therapyStartTime + (unsigned long)_therapyDuration * 60000UL + _totalPauseTime;
+}
+
+// ============================================================
+// 内部：状态转字符串
+// ============================================================
+const char* TherapyStateMachine::_stateToString(TherapyState state) const {
+    switch (state) {
+        case STATE_IDLE:            return "IDLE";
+        case STATE_RUNNING:         return "RUNNING";
+        case STATE_PAUSED:          return "PAUSED";
+        case STATE_EMERGENCY_STOP:  return "EMERGENCY_STOP";
+        case STATE_COMPLETED:       return "COMPLETED";
+        default:                    return "UNKNOWN";
+    }
+}
+
+--------------------------------------------------------------------------------
+
+===== TherapyStateMachine.h =====
+/*
+ * ================================================================
+ * TherapyStateMachine.h — 治疗状态机模块
+ * ================================================================
+ * 管理治疗全生命周期状态：
+ *   IDLE → RUNNING → PAUSED → RUNNING → COMPLETED
+ *                   → STOPPED
+ *   IDLE → EMERGENCY_STOP → IDLE (退出急停)
+ * 
+ * 同时管理连接超时自动停止、治疗时间计算等功能
+ */
+
+#ifndef THERAPY_STATE_MACHINE_H
+#define THERAPY_STATE_MACHINE_H
+
+#include <Arduino.h>
+
+// ============================================================
+// 治疗状态枚举
+// ============================================================
+enum TherapyState {
+    STATE_IDLE = 0,             // 空闲（未开始治疗）
+    STATE_RUNNING,              // 治疗运行中
+    STATE_PAUSED,               // 治疗暂停
+    STATE_EMERGENCY_STOP,       // 紧急停止
+    STATE_COMPLETED             // 治疗完成
+};
+
+// ============================================================
+// 状态变化回调函数类型
+// ============================================================
+typedef void (*StateChangeCallback)(TherapyState oldState, TherapyState newState);
+
+// ============================================================
+// 治疗配置结构体
+// ============================================================
+struct TherapyConfig {
+    uint8_t mode = 0;           // 治疗模式 (0=默认, 1=循环, 2=持续...)
+    uint8_t intensity = 50;     // 治疗强度 (0-100%)
+    uint16_t duration = 30;     // 治疗时长 (分钟)
+    bool configChanged = false; // 配置是否变更
+};
+
+// ============================================================
+// 治疗状态机类
+// ============================================================
+class TherapyStateMachine {
+public:
+    /**
+     * @brief 构造函数
+     */
+    TherapyStateMachine();
+
+    /**
+     * @brief 初始化状态机
+     */
+    void begin();
+
+    /**
+     * @brief 主循环更新（需要在 loop 中调用）
+     * @details 处理超时检测、自动完成等逻辑
+     * @return 当前状态
+     */
+    TherapyState update();
+
+    // ========== 状态转换命令 ==========
+
+    /**
+     * @brief 开始治疗
+     * @param config 治疗配置参数
+     * @return true:成功 false:失败（如急停状态下不能开始）
+     */
+    bool start(TherapyConfig& config);
+
+    /**
+     * @brief 暂停治疗
+     * @return true:成功 false:失败（非运行状态不能暂停）
+     */
+    bool pause();
+
+    /**
+     * @brief 继续治疗（从暂停恢复）
+     * @return true:成功 false:失败（非暂停状态不能继续）
+     */
+    bool resume();
+
+    /**
+     * @brief 停止治疗（正常停止）
+     * @return true:成功 false:失败
+     */
+    bool stop();
+
+    /**
+     * @brief 紧急停止
+     * @return true:成功 false:已处于急停状态
+     */
+    bool emergencyStop();
+
+    /**
+     * @brief 退出急停状态
+     * @return true:成功 false:非急停状态
+     */
+    bool exitEmergencyStop();
+
+    // ========== 连接超时管理 ==========
+
+    /**
+     * @brief 通知连接状态变化
+     * @param connected 当前是否连接
+     * @param disconnectDuration 断开持续时长（毫秒）
+     */
+    void updateConnectionStatus(bool connected, unsigned long disconnectDuration);
+
+    /**
+     * @brief 获取是否因断连而自动停止
+     */
+    bool isAutoStopDueToDisconnect() const { return _autoStopDueToDisconnect; }
+
+    // ========== 状态查询 ==========
+
+    /**
+     * @brief 获取当前状态
+     */
+    TherapyState getState() const { return _currentState; }
+
+    /**
+     * @brief 获取状态名称字符串
+     */
+    const char* getStateName() const;
+
+    /**
+     * @brief 是否正在治疗（RUNNING 或 PAUSED）
+     */
+    bool isTherapyActive() const {
+        return _currentState == STATE_RUNNING || _currentState == STATE_PAUSED;
+    }
+
+    /**
+     * @brief 是否处于急停状态
+     */
+    bool isEmergencyStopped() const {
+        return _currentState == STATE_EMERGENCY_STOP;
+    }
+
+    /**
+     * @brief 是否处于暂停状态
+     */
+    bool isPaused() const {
+        return _currentState == STATE_PAUSED;
+    }
+
+    // ========== 时间相关 ==========
+
+    /**
+     * @brief 获取治疗开始时间
+     */
+    unsigned long getStartTime() const { return _therapyStartTime; }
+
+    /**
+     * @brief 获取治疗结束时间
+     */
+    unsigned long getEndTime() const { return _therapyEndTime; }
+
+    /**
+     * @brief 获取已用时间（秒）
+     */
+    unsigned long getElapsedSeconds() const;
+
+    /**
+     * @brief 获取剩余时间（秒）
+     */
+    unsigned long getRemainingSeconds() const;
+
+    /**
+     * @brief 获取总时长（秒）
+     */
+    unsigned long getTotalSeconds() const { return (unsigned long)_therapyDuration * 60UL; }
+
+    /**
+     * @brief 获取进度百分比 (0-100)
+     */
+    uint8_t getProgressPercent() const;
+
+    /**
+     * @brief 治疗是否已超时
+     */
+    bool isTimeUp() const;
+
+    // ========== 配置管理 ==========
+
+    /**
+     * @brief 获取当前治疗配置
+     */
+    const TherapyConfig& getConfig() const { return _config; }
+
+    /**
+     * @brief 设置治疗模式
+     */
+    void setMode(uint8_t mode);
+
+    /**
+     * @brief 设置治疗强度
+     */
+    void setIntensity(uint8_t intensity);
+
+    /**
+     * @brief 设置治疗时长（分钟）
+     * @param duration 时长（0=使用默认30分钟）
+     */
+    void setDuration(uint16_t duration);
+
+    // ========== 回调注册 ==========
+
+    /**
+     * @brief 注册状态变化回调
+     * @param callback 回调函数指针
+     */
+    void onStateChange(StateChangeCallback callback) {
+        _stateChangeCallback = callback;
+    }
+
+    // ========== 连接超时配置 ==========
+
+    /**
+     * @brief 设置断开连接超时时间
+     * @param timeoutMs 超时毫秒数（默认10000）
+     */
+    void setDisconnectTimeout(unsigned long timeoutMs) {
+        _disconnectTimeout = timeoutMs;
+    }
+
+private:
+    TherapyState _currentState;          // 当前状态
+    TherapyState _previousState;         // 上一个状态（用于暂停恢复）
+    TherapyConfig _config;              // 治疗配置
+
+    unsigned long _therapyStartTime;     // 治疗开始时间
+    unsigned long _therapyEndTime;       // 治疗结束时间
+    unsigned long _pauseStartTime;       // 暂停开始时间
+    unsigned long _totalPauseTime;       // 累计暂停时间
+    uint16_t _therapyDuration;           // 治疗时长（分钟）
+
+    // 连接状态管理
+    bool _wasConnected;                  // 上一轮连接状态
+    unsigned long _disconnectTime;       // 断开连接的时间
+    unsigned long _disconnectTimeout;    // 断开超时时间（毫秒）
+    bool _autoStopDueToDisconnect;       // 是否因断连而自动停止
+
+    // 回调
+    StateChangeCallback _stateChangeCallback;
+
+    // 内部方法
+    void _transitionTo(TherapyState newState);
+    void _recalculateEndTime();
+    const char* _stateToString(TherapyState state) const;
+};
+
+#endif // THERAPY_STATE_MACHINE_H
+
+--------------------------------------------------------------------------------
+
+===== TimeStamp.cpp =====
+/*
+ * ================================================================
+ * TimeStamp.cpp — 系统时间管理模块实现
+ * ================================================================
+ */
+
+#include "TimeStamp.h"
+
+// ============================================================
+// 全局时间戳对象
+// ============================================================
+TimeStamp systemTime;
+
+// ============================================================
+// 构造函数
+// ============================================================
+TimeStamp::TimeStamp()
+    : _baseTime(0)
+    , _syncMillis(0)
+    , _synced(false)
+{
+}
+
+// ============================================================
+// 初始化
+// ============================================================
+void TimeStamp::begin() {
+    _baseTime = 0;
+    _syncMillis = 0;
+    _synced = false;
+    Serial.println(F("[时间戳] 模块初始化完成，等待上位机同步..."));
+}
+
+// ============================================================
+// 同步系统时间
+// ============================================================
+void TimeStamp::syncTime(unsigned long long unixTimeMs) {
+    _baseTime = unixTimeMs;
+    _syncMillis = millis();
+    _synced = true;
+    
+    Serial.print(F("[时间戳] 时间同步成功: "));
+    unsigned long seconds = (unsigned long)(unixTimeMs / 1000ULL);
+    Serial.print(seconds);
+    Serial.println(F(" (Unix秒)"));
+}
+
+// ============================================================
+// 获取当前系统时间（毫秒）
+// ============================================================
+unsigned long long TimeStamp::getCurrentTimeMs() {
+    if (!_synced) {
+        return 0;
+    }
+    unsigned long elapsed = millis() - _syncMillis;
+    return _baseTime + (unsigned long long)elapsed;
+}
+
+// ============================================================
+// 获取时间戳数据总长度
+// ============================================================
+uint8_t TimeStamp::getTimestampLength() const {
+    return _synced ? TIMESTAMP_LEN_ABS : TIMESTAMP_LEN_REL;
+}
+
+// ============================================================
+// 获取时间戳写入缓冲区
+// ============================================================
+uint8_t TimeStamp::getTimestampBytes(byte* buffer) {
+    if (_synced) {
+        // 绝对时间：flag(1) + timestamp(8)
+        buffer[0] = TIMESTAMP_FLAG_ABS;
+        unsigned long long timestamp = getCurrentTimeMs();
+        for (uint8_t i = 0; i < 8; i++) {
+            buffer[1 + i] = (byte)((timestamp >> (i * 8)) & 0xFF);
+        }
+        return TIMESTAMP_LEN_ABS;
+    } else {
+        // 相对时间：flag(1) + timestamp(4)
+        buffer[0] = TIMESTAMP_FLAG_REL;
+        unsigned long timestamp = millis();
+        for (uint8_t i = 0; i < 4; i++) {
+            buffer[1 + i] = (byte)((timestamp >> (i * 8)) & 0xFF);
+        }
+        return TIMESTAMP_LEN_REL;
+    }
+}
+
+--------------------------------------------------------------------------------
+
+===== TimeStamp.h =====
+/*
+ * ================================================================
+ * TimeStamp.h — 系统时间管理模块
+ * ================================================================
+ * 接收上位机发来的NTP时间，维持内部时钟
+ * 为所有上报数据帧添加时间戳
+ * 
+ * 时间戳格式（与原WiFi中转模块兼容）：
+ *   [flag(1)] [timestamp(8或4)]
+ *   flag=0x01: 绝对时间（Unix毫秒，8字节）
+ *   flag=0x00: 相对时间（millis，4字节）
+ */
+
+#ifndef TIMESTAMP_H
+#define TIMESTAMP_H
+
+#include <Arduino.h>
+
+// ============================================================
+// 时间戳标志位
+// ============================================================
+#define TIMESTAMP_FLAG_ABS  0x01   // 绝对时间（Unix毫秒）
+#define TIMESTAMP_FLAG_REL  0x00   // 相对时间（millis）
+
+// ============================================================
+// 时间戳数据长度
+// ============================================================
+#define TIMESTAMP_LEN_ABS   9      // flag(1) + timestamp(8)
+#define TIMESTAMP_LEN_REL   5      // flag(1) + timestamp(4)
+
+// ============================================================
+// TimeStamp 类
+// ============================================================
+class TimeStamp {
+public:
+    /**
+     * @brief 构造函数
+     */
+    TimeStamp();
+
+    /**
+     * @brief 初始化时间模块
+     */
+    void begin();
+
+    /**
+     * @brief 同步系统时间（接收上位机NTP时间）
+     * @param unixTimeMs Unix毫秒时间戳（8字节）
+     */
+    void syncTime(unsigned long long unixTimeMs);
+
+    /**
+     * @brief 获取当前系统时间（毫秒）
+     * @return Unix毫秒时间戳，未同步时返回0
+     */
+    unsigned long long getCurrentTimeMs();
+
+    /**
+     * @brief 时间是否已同步
+     */
+    bool isSynchronized() const { return _synced; }
+
+    /**
+     * @brief 获取时间戳写入缓冲区
+     * @param buffer 输出缓冲区（至少9字节）
+     * @return 写入的字节数（已同步9，未同步5）
+     */
+    uint8_t getTimestampBytes(byte* buffer);
+
+    /**
+     * @brief 获取时间戳数据总长度（flag + timestamp）
+     * @return 字节数（9或5）
+     */
+    uint8_t getTimestampLength() const;
+
+    /**
+     * @brief 获取上次同步时间（millis()值）
+     */
+    unsigned long getLastSyncMillis() const { return _syncMillis; }
+
+private:
+    unsigned long long _baseTime;    // NTP同步时的基准时间（Unix毫秒）
+    unsigned long _syncMillis;       // NTP同步时的millis()值
+    bool _synced;                    // 是否已同步
+};
+
+// 全局时间戳对象声明
+extern TimeStamp systemTime;
+
+#endif // TIMESTAMP_H
+
+--------------------------------------------------------------------------------
+
