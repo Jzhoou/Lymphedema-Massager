@@ -16,7 +16,7 @@ ServoController::ServoController(uint8_t i2cAddress)
   targetForce[1] = 20.0; kp[1] = 0.35; ki[1] = 0.0; kd[1] = 0.0;
   targetForce[2] = 20.0; kp[2] = 0.5; ki[2] = 0.0; kd[2] = 0.0;
   targetForce[3] = 20.0; kp[3] = 0.4; ki[3] = 0.0; kd[3] = 0.0;
-  targetForce[4] = 7.0;  kp[4] = 1.5; ki[4] = 0.0; kd[4] = 0.0;
+  targetForce[4] = 15.0;  kp[4] = 0.5; ki[4] = 0.0; kd[4] = 0.0;
   targetForce[5] = 20.0; kp[5] = 0.3; ki[5] = 0.0; kd[5] = 0.0;
 }
 
