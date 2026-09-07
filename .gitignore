@@ -1,0 +1,22 @@
+# .NET / Visual Studio output
+**/bin/
+**/obj/
+.vs/
+**/.vs/
+
+# Embedded build output
+**/build/
+*.elf
+*.hex
+*.map
+*.o
+*.d
+
+# Archives and backups
+*.rar
+*.zip
+*.back
+
+# Local secrets
+secrets.h
+**/secrets.h
