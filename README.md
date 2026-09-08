@@ -39,7 +39,7 @@
 - `ServoController` 基于 PCA9685 PWM 驱动多路舵机，支持单通道/批量 PWM 设置，以及每通道独立的目标压力与 PID 参数。
 - 治疗伸出阶段根据多通道压力反馈更新舵机输出；输出限制用于约束 PWM 调节范围。
 - `motor_control` 通过独立串口控制两台步进电机，提供伸出、收回、停止、回零、单电机步进和双电机同步/异步步进接口。
-- 非阻塞轮询缓存电机位置与到位状态；治疗循环根据双电机到位结果切换运动阶段，并保留超时兜底。
+- 0x04 电机的到位状态由非阻塞状态机轮询；位置通过阻塞式读取并做短时缓存，当前批量位置上报复用同一位置值。治疗循环根据双电机到位结果切换运动阶段，并保留超时兜底。
 
 ### OLED 显示：`DisplayHelper`
 
@@ -122,6 +122,6 @@ dotnet build "上位机/measurement-perception-master/Upcomputer.App/Upcomputer.
 
 This repository contains a **team-built engineering prototype** of a lymphedema massager control system. **My contribution is limited to the embedded controller firmware**: sensor and actuator drivers, BM53 device communication, telemetry, and therapy-control flow. The .NET 8/WPF desktop application is included only as system and integration context and is **not claimed as my individual work**.
 
-The firmware implements a therapy state machine; calibrated multi-channel pressure acquisition; I²C-based AD5933 impedance measurement; servo pressure feedback and dual stepper-motor control; SSD1306 OLED status views; scheduled data reporting; and a BM53 framed protocol with an RX ring buffer, TX queue, heartbeat tracking, ACK/NAK handling, and device, pressure, edema-related, progress, and motor-status payloads.
+The firmware implements a therapy state machine; calibrated multi-channel pressure acquisition; I²C-based AD5933 impedance measurement; servo pressure feedback and dual stepper-motor control; SSD1306 OLED status views; scheduled data reporting; and a BM53 framed protocol with an RX ring buffer, TX queue, heartbeat tracking, ACK/NAK handling, and device, pressure, edema-related, progress, and motor-status payloads. Motor `0x04` arrival status is polled by a non-blocking state machine, while position reads are blocking and briefly cached; the current batch position report reuses that same position value for both motor fields.
 
 This is an engineering prototype, **not a certified medical device**. No clinical efficacy, safety performance, or measurement-accuracy claim is made. Hardware-specific calibration and full system validation are required before any safety-critical use.

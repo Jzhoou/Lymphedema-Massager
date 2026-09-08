@@ -16,6 +16,7 @@
 *.rar
 *.zip
 *.back
+code_output.txt
 
 # Local secrets
 secrets.h
