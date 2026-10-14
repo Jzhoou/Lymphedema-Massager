@@ -70,29 +70,26 @@
 ## 目录结构
 
 ```text
-.
-├─ 下位机/
-│  └─ main/
-│     ├─ main.ino                    # 初始化、主循环与模块编排
-│     ├─ TherapyStateMachine.*       # 治疗状态与计时
-│     ├─ PressureSensor.* / MY2901.* # 压力采集与标定转换
-│     ├─ AD5933.*                    # I²C 阻抗测量
-│     ├─ ServoController.*           # 多通道舵机与压力反馈控制
-│     ├─ motor_control.*             # 双步进电机控制与状态轮询
-│     ├─ DisplayHelper.*             # OLED 显示
-│     ├─ BM53_Protocol.*             # 帧协议、缓冲与发送队列
-│     ├─ DataReporter.*              # 状态数据汇聚与上报
-│     ├─ TimeStamp.*                 # 协议时间戳支持
-│     └─ config.h                    # 通道、标定与采样配置
-└─ 上位机/
-   └─ measurement-perception-master/
-      ├─ Upcomputer.App/             # .NET 8 / WPF 启动项目（团队背景）
-      ├─ Upcomputer.Communication/   # 通信与协议解析（团队背景）
-      ├─ Upcomputer.Core/            # 模型与服务（团队背景）
-      ├─ Upcomputer.Data/            # 数据访问（团队背景）
-      ├─ Upcomputer.UI/              # WPF 界面（团队背景）
-      └─ Upcomputer.Common/          # 公共组件（团队背景）
+Lymphedema-Massager/
+├─ README.md                              # 项目介绍、目录与使用说明
+├─ 程序/
+│  ├─ 下位机/
+│  │  └─ main/
+│  │     ├─ main.ino                       # Arduino 工程入口
+│  │     └─ 其他 .ino / .cpp / .h 文件     # 驱动、通信与流程控制
+│  └─ 上位机/
+│     └─ measurement-perception-master/   # .NET 8 / WPF 团队工程
+└─ 模型/
+   └─ 第二版建模sw文件/
+      ├─ 总装配体.SLDASM                  # 整机总装配体
+      ├─ 按摩环内装配体.SLDASM
+      ├─ 舵机按摩头装配体.SLDASM
+      ├─ 其他 .SLDASM / .SLDPRT 文件      # 子装配体与配套零件
+      └─ 压力/                           # 压力传感器模型与 STP 文件
 ```
+
+- [程序目录](程序/)：上位机与下位机源码。
+- [建模目录](模型/)：SolidWorks 装配体、零件和 STP 模型，保留原文件名与子目录结构。
 
 ## 构建说明
 
@@ -102,7 +99,7 @@
 
 1. 安装与目标 BMduino/Arduino 兼容控制板匹配的开发板支持包和工具链。
 2. 安装源码引用的库：`Wire`、`Adafruit GFX Library`、`Adafruit SSD1306`、`Adafruit PWM Servo Driver Library`（及其依赖 `Adafruit BusIO`）。
-3. 在 IDE 或等价 CLI 环境中打开 `下位机/main/main.ino`，选择实际控制板与端口后编译。
+3. 在 IDE 或等价 CLI 环境中打开 [`程序/下位机/main/main.ino`](程序/下位机/main/main.ino)，选择实际控制板与端口后编译。
 4. 烧录前复核 `config.h`、AD5933 校准系数、串口/I²C 引脚、限位开关、方向、行程及压力控制参数；这些值与具体样机绑定。
 
 仓库没有提供可复现的锁定版开发板包或一键式固件构建脚本，因此不同本地工具链可能需要额外的板卡配置。
@@ -112,11 +109,17 @@
 要求 Windows 与 .NET 8 SDK。在仓库根目录运行：
 
 ```powershell
-dotnet restore "上位机/measurement-perception-master/Upcomputer.App/Upcomputer.App.csproj"
-dotnet build "上位机/measurement-perception-master/Upcomputer.App/Upcomputer.App.csproj" --nologo --verbosity:minimal
+dotnet restore "程序/上位机/measurement-perception-master/Upcomputer.App/Upcomputer.App.csproj"
+dotnet build "程序/上位机/measurement-perception-master/Upcomputer.App/Upcomputer.App.csproj" --nologo --verbosity:minimal
 ```
 
 该 WPF 工程用于说明团队系统和联调环境，不代表本人的个人交付范围。
+
+## 建模文件使用
+
+使用 SolidWorks 打开 [`模型/第二版建模sw文件/总装配体.SLDASM`](模型/第二版建模sw文件/总装配体.SLDASM)。请下载完整模型目录并保留零件与子目录，以便装配体加载配套文件。`压力/` 子目录包含压力传感器装配体、零件与 STP 交换格式模型。
+
+建模资料作为团队项目配套资料归档，不改变前述个人贡献范围说明；上传时排除了 `~$` 开头的 SolidWorks 临时锁文件。
 
 ## English summary
 

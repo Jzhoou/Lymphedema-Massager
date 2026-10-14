@@ -21,3 +21,6 @@ code_output.txt
 # Local secrets
 secrets.h
 **/secrets.h
+
+# SolidWorks temporary lock files
+~$*
