@@ -2,7 +2,7 @@
 
 > **团队项目与贡献边界**
 >
-> 本仓库记录的是一个团队工程项目。**本人仅负责下位机电控程序**，包括传感器与执行器驱动、设备通信、数据上报和治疗控制流程。仓库中的 **.NET 8 / WPF 上位机属于完整系统背景，不是本人的个人成果**；保留其代码是为了说明设备端协议的联调对象与整体工程上下文。
+> 本仓库记录的是一个团队工程项目。**本人负责下位机电控程序，并参与了部分机械建模工作**。下位机电控部分包括传感器与执行器驱动、设备通信、数据上报和治疗控制流程；机械建模由团队协作完成，本人参与其中的部分工作。仓库中的 **.NET 8 / WPF 上位机属于完整系统背景，不是本人的个人成果**；保留其代码是为了说明设备端协议的联调对象与整体工程上下文。
 
 ## 项目概述
 
@@ -119,11 +119,11 @@ dotnet build "程序/上位机/measurement-perception-master/Upcomputer.App/Upco
 
 使用 SolidWorks 打开 [`模型/第二版建模sw文件/总装配体.SLDASM`](模型/第二版建模sw文件/总装配体.SLDASM)。请下载完整模型目录并保留零件与子目录，以便装配体加载配套文件。`压力/` 子目录包含压力传感器装配体、零件与 STP 交换格式模型。
 
-建模资料作为团队项目配套资料归档，不改变前述个人贡献范围说明；上传时排除了 `~$` 开头的 SolidWorks 临时锁文件。
+建模资料由团队协作完成，**本人参与了部分机械建模工作**，本目录归档项目完整配套模型。上传时排除了 `~$` 开头的 SolidWorks 临时锁文件。
 
 ## English summary
 
-This repository contains a **team-built engineering prototype** of a lymphedema massager control system. **My contribution is limited to the embedded controller firmware**: sensor and actuator drivers, BM53 device communication, telemetry, and therapy-control flow. The .NET 8/WPF desktop application is included only as system and integration context and is **not claimed as my individual work**.
+This repository contains a **team-built engineering prototype** of a lymphedema massager control system. **I was responsible for the embedded controller firmware and also contributed to part of the mechanical CAD modeling.** The firmware work covers sensor and actuator drivers, BM53 device communication, telemetry, and therapy-control flow. The mechanical models were developed collaboratively by the team. The .NET 8/WPF desktop application is included only as system and integration context and is **not claimed as my individual work**.
 
 The firmware implements a therapy state machine; calibrated multi-channel pressure acquisition; I²C-based AD5933 impedance measurement; servo pressure feedback and dual stepper-motor control; SSD1306 OLED status views; scheduled data reporting; and a BM53 framed protocol with an RX ring buffer, TX queue, heartbeat tracking, ACK/NAK handling, and device, pressure, edema-related, progress, and motor-status payloads. Motor `0x04` arrival status is polled by a non-blocking state machine, while position reads are blocking and briefly cached; the current batch position report reuses that same position value for both motor fields.
 
